@@ -6,7 +6,7 @@ This living document records implemented architecture and agreed design decision
 
 **Decided; partially implemented.** The Go application is composed with Uber Fx. The domain must remain independent of Fx, HTTP, SQS, and persistence libraries. HTTP handlers and the SQS consumer will eventually call the same application use cases. Infrastructure adapters will implement interfaces required by the application/domain layers.
 
-Configuration, application composition, an HTTP server, and the Money domain value object exist today. Other domain models, application use cases, persistence adapters, and messaging components are not implemented yet.
+Configuration, application composition, an HTTP server, the Money value object, and the Wallet aggregate exist today. Other domain models, application use cases, persistence adapters, and messaging components are not implemented yet.
 
 ## Application composition and lifecycle
 
@@ -36,6 +36,18 @@ Currency codes are normalized to uppercase. Validation currently checks ISO 4217
 `Money{}` is intentionally invalid; use `Zero(currency)` for monetary zero. Public operations and accessors reject uninitialized values with `ErrInvalidMoney`. Parsing, addition, subtraction, and negation explicitly detect overflow and return `ErrOverflow` instead of wrapping; negating the minimum `int64` value is rejected.
 
 JSON mapping and PostgreSQL persistence mapping are **To be decided**.
+
+## Wallet
+
+**Implemented.** `internal/domain/wallet` contains an aggregate with private identity, player ID, currency, Money balance, signed `int64` version, and creation/update timestamps. `New` accepts explicit IDs, currency, initial balance, and time. IDs are opaque non-empty UTF-8 strings without whitespace or control characters; UUID syntax is not required. Currency validation and normalization use Money. The initial balance must be valid, non-negative, and match the wallet currency. Creation starts at version `1`.
+
+`Wallet` is a mutable aggregate with private state; pointer-based `Credit` and `Debit` mutate it and return an error. Money remains immutable. All validations and calculations complete before any aggregate fields change. Getters return values, and no setters or mutable references are exposed. Uninitialized wallets reject financial operations. Read-only getters expose zero state on an uninitialized wallet, including an invalid Money balance.
+
+Amounts must be valid, non-negative Money in the wallet currency. Insufficient funds return `ErrInsufficientBalance`; invalid initial balances and operation amounts have separate errors. Wrapped Money errors remain detectable through `errors.Is`, including currency mismatch and monetary overflow. Every failure leaves balance, version, and timestamps unchanged.
+
+Valid zero credits/debits are no-ops: balance, version, and timestamps remain unchanged, consistent with the README's balance-change version rule. Positive changes increment the version exactly once; version overflow is rejected. The application layer supplies processing timestamps, stored in UTC. Creation and balance-changing operations require non-zero timestamps. Timestamp ordering is not a Wallet invariant; earlier timestamps are accepted. Valid zero operations require no timestamp, but still validate the Wallet, Money, and currency. `createdAt` never changes.
+
+This checkpoint enforces only in-memory balance invariants and creates no ledger entries or events. Rehydration, global uniqueness of `(playerId, currency)`, durable ledger consistency, PostgreSQL transaction boundaries, and cross-instance concurrency control remain **To be decided**.
 
 ## Concurrency direction
 
