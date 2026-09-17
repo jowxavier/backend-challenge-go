@@ -6,7 +6,7 @@ This living document records implemented architecture and agreed design decision
 
 **Decided; partially implemented.** The Go application is composed with Uber Fx. The domain must remain independent of Fx, HTTP, SQS, and persistence libraries. HTTP handlers and the SQS consumer will eventually call the same application use cases. Infrastructure adapters will implement interfaces required by the application/domain layers.
 
-Only configuration, application composition, and an HTTP server exist today. Domain models, application use cases, persistence adapters, and messaging components are not implemented yet.
+Configuration, application composition, an HTTP server, and the Money domain value object exist today. Other domain models, application use cases, persistence adapters, and messaging components are not implemented yet.
 
 ## Application composition and lifecycle
 
@@ -27,11 +27,15 @@ Defaults apply when variables are absent. An explicitly empty `HTTP_PORT` is rej
 
 ## Money
 
-**Decided; not implemented.** `Money` will be an immutable domain value object containing an `int64` amount in minor units and a currency. Monetary values must never pass through `float32` or `float64` during parsing, calculation, serialization, or persistence.
+**Implemented.** `Money` is an immutable domain value object containing an `int64` amount in minor units and a currency, with private fields and value-returning operations. Its range at the fixed two-decimal scale is `-92233720368547758.08` through `92233720368547758.07`. Parsing, calculations, and amount serialization use no floating-point values.
 
-External amounts use decimal strings with a fixed maximum scale of two decimal places. Operations across different currencies are invalid. Parsing and arithmetic must explicitly detect overflow, including addition, subtraction, and negation.
+External parsing accepts non-negative decimal strings with an integer part and an optional one- or two-digit fraction. Leading zeros are accepted; signs, whitespace, and trailing decimal points are rejected. `Amount()` serializes with exactly two decimal places, so `10`, `10.5`, and `0010.50` normalize to `10.00`, `10.50`, and `10.50`, respectively. Negative values are supported for internal calculations.
 
-Accepted equivalent input forms, normalization, serialization details, and database mapping are **To be decided**.
+Currency codes are normalized to uppercase. Validation currently checks ISO 4217-style syntax only (three ASCII letters), not membership in the complete ISO currency registry. Arithmetic and comparison across different currencies return `ErrCurrencyMismatch`.
+
+`Money{}` is intentionally invalid; use `Zero(currency)` for monetary zero. Public operations and accessors reject uninitialized values with `ErrInvalidMoney`. Parsing, addition, subtraction, and negation explicitly detect overflow and return `ErrOverflow` instead of wrapping; negating the minimum `int64` value is rejected.
+
+JSON mapping and PostgreSQL persistence mapping are **To be decided**.
 
 ## Concurrency direction
 
