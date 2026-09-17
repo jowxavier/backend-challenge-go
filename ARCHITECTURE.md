@@ -35,7 +35,7 @@ Currency codes are normalized to uppercase. Validation currently checks ISO 4217
 
 `Money{}` is intentionally invalid; use `Zero(currency)` for monetary zero. Public operations and accessors reject uninitialized values with `ErrInvalidMoney`. Parsing, addition, subtraction, and negation explicitly detect overflow and return `ErrOverflow` instead of wrapping; negating the minimum `int64` value is rejected.
 
-JSON mapping and PostgreSQL persistence mapping are **To be decided**.
+PostgreSQL amounts use BIGINT minor units. `FromMinorUnits(int64, currency)` accepts the full signed range without conversion, validates/normalizes currency, and preserves internal negative values. `MinorUnits() (int64, error)` rejects uninitialized Money. JSON mapping remains **To be decided**.
 
 ## Wallet
 
@@ -47,7 +47,7 @@ Amounts must be valid, non-negative Money in the wallet currency. Insufficient f
 
 Valid zero credits/debits are no-ops: balance, version, and timestamps remain unchanged, consistent with the README's balance-change version rule. Positive changes increment the version exactly once; version overflow is rejected. The application layer supplies processing timestamps, stored in UTC. Creation and balance-changing operations require non-zero timestamps. Timestamp ordering is not a Wallet invariant; earlier timestamps are accepted. Valid zero operations require no timestamp, but still validate the Wallet, Money, and currency. `createdAt` never changes.
 
-This checkpoint enforces only in-memory balance invariants and creates no ledger entries or events. Rehydration, global uniqueness of `(playerId, currency)`, durable ledger consistency, PostgreSQL transaction boundaries, and cross-instance concurrency control remain **To be decided**.
+This checkpoint enforces only in-memory balance invariants and creates no ledger entries or events. Global uniqueness of `(playerId, currency)` is enforced by the initial schema. Durable ledger consistency, PostgreSQL transaction boundaries, and cross-instance concurrency control remain **To be decided**.
 
 ## WagerTransaction
 
@@ -61,7 +61,31 @@ Application-supplied processing timestamps must be non-zero and are normalized t
 
 FailureCode is distinct from Go validation errors. `Reject` accepts business codes `BET_INSUFFICIENT_FUNDS`, `REVERSAL_INSUFFICIENT_FUNDS`, and `REFERENCE_NOT_FOUND`; `Fail` accepts `PERMANENT_INFRASTRUCTURE_FAILURE`. This small catalog validates the business/infrastructure category, not code applicability to individual operation kinds. The application must select the appropriate outcome and classify infrastructure failures; temporary outages do not imply FAILED. Wrapped Money errors remain available through `errors.Is`.
 
-**Deferred:** OPENING, reference resolution and resolved internal reference ID, cross-transaction validation, idempotency/key storage, payload hashing, result balance/replay, persistence and rehydration, ledger, and outbox. No financial movement or event generation occurs here. Future application code must coordinate WagerTransaction, Wallet, Ledger, and Outbox atomically.
+**Deferred:** OPENING, reference resolution and resolved internal reference ID, cross-transaction validation, idempotency/key storage, payload hashing, result balance/replay, repositories, ledger, and outbox. Initial persistence schema and explicit rehydration are implemented below. No financial movement or event generation occurs here. Future application code must coordinate WagerTransaction, Wallet, Ledger, and Outbox atomically.
+
+## Persistence checkpoint 1
+
+**Implemented.** Wallet and WagerTransaction expose `Rehydrate(State)` constructors that validate local persisted invariants and initialize private fields directly. They invoke no financial operations or transitions. Versions, statuses, failure codes, and timestamps are preserved exactly, including timestamp locations and earlier updatedAt values. Wallet rehydration rejects noncanonical currency rather than silently normalizing stored state. Creation still normalizes currency and processing timestamps. WagerTransaction rehydration accepts all five valid states with compatible failure codes; reference resolution is not implied.
+
+Versioned golang-migrate SQL files in `migrations/` create only `wallets` and `wager_transactions` (plus migration-tool metadata). IDs are TEXT; amounts and wallet versions are BIGINT; timestamps are TIMESTAMPTZ. Optional references and failure codes use NULL. Wallet constraints enforce non-empty identities, unique player/currency, non-negative balance, positive version, and uppercase ASCII currency. Transaction constraints enforce unique provider/external identity, wallet existence without cascading deletion, kind/status, amount policy, reference presence/self-reference, and failure-code/status compatibility. External references deliberately have no foreign key. An index supports wallet transaction lookup. These constraints validate stored rows, not historical transition ordering or ledger consistency.
+
+`compose.yaml` pins PostgreSQL to `17.11-bookworm` with a named persistent volume, localhost port binding, and a health check. A separate tools-profile migration service pins golang-migrate to `v4.18.3`; applications do not run migrations at startup. Each up/down migration uses an explicit SQL transaction. Environment defaults are local examples in `.env.example`; credentials with URL-reserved characters require URL encoding in the migration connection URI.
+
+Local commands (Docker Desktop/Engine with Compose required):
+
+```sh
+docker compose config --quiet
+docker compose up -d --wait postgres
+docker compose run --rm migrate up
+docker compose run --rm migrate version
+# Removes the most recently applied table; use only on disposable development data.
+docker compose run --rm migrate down 1
+docker compose run --rm migrate up
+```
+
+For an isolated up/down verification, use a separate Compose project and unused port consistently, for example `POSTGRES_PORT=55439 docker compose -p wager-persistence-check1 ...`. After applying both migrations, `run --rm migrate down 2` removes both application tables; apply `up` again to verify reversibility. `down` without `--volumes` stops that project's containers while retaining its database. Changing POSTGRES initialization settings does not rewrite an existing volume.
+
+PostgreSQL timestamp storage has microsecond precision; rehydration itself never truncates or replaces timestamps. Database adapters must handle UTC display and persistence precision explicitly. Repository implementation and per-wallet concurrency locking are the next checkpoint; no repositories, transaction runner, locking, or financial processing exist yet.
 
 ## Concurrency direction
 

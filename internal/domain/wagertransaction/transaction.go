@@ -74,6 +74,19 @@ type WagerTransaction struct {
 }
 
 func NewExternal(input ExternalInput, at time.Time) (*WagerTransaction, error) {
+	return Rehydrate(State{ExternalInput: input, Status: PENDING, CreatedAt: at.UTC(), UpdatedAt: at.UTC()})
+}
+
+// State contains only persisted local state, not resolved references or wallet effects.
+type State struct {
+	ExternalInput
+	Status               Status
+	FailureCode          FailureCode
+	CreatedAt, UpdatedAt time.Time
+}
+
+func Rehydrate(s State) (*WagerTransaction, error) {
+	input := s.ExternalInput
 	for _, field := range []struct{ name, value string }{
 		{"id", input.ID}, {"providerId", input.ProviderID}, {"externalTransactionId", input.ExternalTransactionID},
 		{"playerId", input.PlayerID}, {"walletId", input.WalletID}, {"roundId", input.RoundID}, {"gameId", input.GameID},
@@ -109,14 +122,37 @@ func NewExternal(input ExternalInput, at time.Time) (*WagerTransaction, error) {
 	if ((input.Kind == REFUND || input.Kind == ROLLBACK) && ref == "") || ((input.Kind == BET || input.Kind == LOSS) && ref != "") {
 		return nil, ErrInvalidReference
 	}
-	if at.IsZero() {
+	if s.CreatedAt.IsZero() || s.UpdatedAt.IsZero() {
 		return nil, ErrInvalidTime
+	}
+	switch s.Status {
+	case PENDING, PROCESSED:
+		if s.FailureCode != "" {
+			return nil, ErrInvalidFailureCode
+		}
+	case PENDING_REFERENCE:
+		if ref == "" {
+			return nil, ErrInvalidReference
+		}
+		if s.FailureCode != "" {
+			return nil, ErrInvalidFailureCode
+		}
+	case REJECTED:
+		if !businessCode(s.FailureCode) {
+			return nil, ErrInvalidFailureCode
+		}
+	case FAILED:
+		if s.FailureCode != PermanentInfrastructureFailure {
+			return nil, ErrInvalidFailureCode
+		}
+	default:
+		return nil, ErrInvalidTransaction
 	}
 	return &WagerTransaction{
 		id: input.ID, providerID: input.ProviderID, externalTransactionID: input.ExternalTransactionID,
 		playerID: input.PlayerID, walletID: input.WalletID, roundID: input.RoundID, gameID: input.GameID,
 		kind: input.Kind, money: input.Money, referenceExternalTransactionID: ref,
-		status: PENDING, createdAt: at.UTC(), updatedAt: at.UTC(),
+		status: s.Status, failureCode: s.FailureCode, createdAt: s.CreatedAt, updatedAt: s.UpdatedAt,
 	}, nil
 }
 
@@ -192,4 +228,13 @@ func (t *WagerTransaction) transition(next Status, code FailureCode, at time.Tim
 	t.failureCode = code
 	t.updatedAt = at.UTC()
 	return nil
+}
+
+func businessCode(code FailureCode) bool {
+	switch code {
+	case BetInsufficientFunds, ReversalInsufficientFunds, ReferenceNotFound:
+		return true
+	default:
+		return false
+	}
 }

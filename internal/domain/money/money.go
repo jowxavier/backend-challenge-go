@@ -158,3 +158,20 @@ func (m Money) Currency() (string, error) {
 	}
 	return m.currency, nil
 }
+
+// FromMinorUnits constructs exact signed money, including internal negative values.
+func FromMinorUnits(minorUnits int64, currency string) (Money, error) {
+	m, err := Zero(currency)
+	if err != nil {
+		return Money{}, err
+	}
+	m.minorUnits = minorUnits
+	return m, nil
+}
+
+func (m Money) MinorUnits() (int64, error) {
+	if err := m.validate(); err != nil {
+		return 0, err
+	}
+	return m.minorUnits, nil
+}

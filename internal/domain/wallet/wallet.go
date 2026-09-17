@@ -37,32 +37,57 @@ type Wallet struct {
 // New creates a wallet at version 1. IDs are opaque non-empty strings without
 // whitespace or control characters. Time is supplied by the caller and stored in UTC.
 func New(id, playerID, currency string, initialBalance money.Money, at time.Time) (Wallet, error) {
-	if !validID(id) {
-		return Wallet{}, ErrInvalidWalletID
-	}
-	if !validID(playerID) {
-		return Wallet{}, ErrInvalidPlayerID
-	}
 	zero, err := money.Zero(currency)
 	if err != nil {
 		return Wallet{}, err
 	}
-	cmp, err := initialBalance.Compare(zero)
+	normalized, err := zero.Currency()
+	if err != nil {
+		return Wallet{}, err
+	}
+	return Rehydrate(State{ID: id, PlayerID: playerID, Currency: normalized, Balance: initialBalance, Version: 1, CreatedAt: at.UTC(), UpdatedAt: at.UTC()})
+}
+
+// State carries persisted values; Rehydrate validates and copies it without operations.
+type State struct {
+	ID, PlayerID, Currency string
+	Balance                money.Money
+	Version                int64
+	CreatedAt, UpdatedAt   time.Time
+}
+
+func Rehydrate(s State) (Wallet, error) {
+	if !validID(s.ID) {
+		return Wallet{}, ErrInvalidWalletID
+	}
+	if !validID(s.PlayerID) {
+		return Wallet{}, ErrInvalidPlayerID
+	}
+	zero, err := money.Zero(s.Currency)
+	if err != nil {
+		return Wallet{}, err
+	}
+	normalized, err := zero.Currency()
+	if err != nil {
+		return Wallet{}, err
+	}
+	if s.Currency != normalized {
+		return Wallet{}, money.ErrInvalidCurrency
+	}
+	cmp, err := s.Balance.Compare(zero)
 	if err != nil {
 		return Wallet{}, fmt.Errorf("%w: %w", ErrInvalidInitialBalance, err)
 	}
 	if cmp < 0 {
 		return Wallet{}, ErrInvalidInitialBalance
 	}
-	if at.IsZero() {
+	if s.Version < 1 {
+		return Wallet{}, ErrInvalidWallet
+	}
+	if s.CreatedAt.IsZero() || s.UpdatedAt.IsZero() {
 		return Wallet{}, ErrInvalidTime
 	}
-	normalized, err := zero.Currency()
-	if err != nil {
-		return Wallet{}, err
-	}
-	return Wallet{id: id, playerID: playerID, currency: normalized, balance: initialBalance,
-		version: 1, createdAt: at.UTC(), updatedAt: at.UTC()}, nil
+	return Wallet{id: s.ID, playerID: s.PlayerID, currency: s.Currency, balance: s.Balance, version: s.Version, createdAt: s.CreatedAt, updatedAt: s.UpdatedAt}, nil
 }
 
 func validID(id string) bool {
