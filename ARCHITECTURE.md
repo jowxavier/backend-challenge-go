@@ -6,7 +6,7 @@ This living document records implemented architecture and agreed design decision
 
 **Decided; partially implemented.** The Go application is composed with Uber Fx. The domain must remain independent of Fx, HTTP, SQS, and persistence libraries. HTTP handlers and the SQS consumer will eventually call the same application use cases. Infrastructure adapters will implement interfaces required by the application/domain layers.
 
-Configuration, application composition, an HTTP server, the Money value object, and the Wallet aggregate exist today. Other domain models, application use cases, persistence adapters, and messaging components are not implemented yet.
+Configuration, application composition, an HTTP server, the Money value object, the Wallet aggregate, and the WagerTransaction entity exist today. Other domain models, application use cases, persistence adapters, and messaging components are not implemented yet.
 
 ## Application composition and lifecycle
 
@@ -49,6 +49,20 @@ Valid zero credits/debits are no-ops: balance, version, and timestamps remain un
 
 This checkpoint enforces only in-memory balance invariants and creates no ledger entries or events. Rehydration, global uniqueness of `(playerId, currency)`, durable ledger consistency, PostgreSQL transaction boundaries, and cross-instance concurrency control remain **To be decided**.
 
+## WagerTransaction
+
+**Implemented.** `internal/domain/wagertransaction` models external BET, WIN, LOSS, REFUND, and ROLLBACK operations as a mutable entity with private state. It owns internal/provider/external identity, player/wallet/round/game context, kind, immutable Money, optional external reference, status, failure code, and creation/update timestamps. IDs follow Wallet's opaque non-empty UTF-8 policy without whitespace or control characters. `(providerId, externalTransactionId)` identifies the financial operation conceptually; uniqueness is not enforced by this in-memory entity.
+
+`NewExternal` starts in PENDING. BET/WIN/REFUND/ROLLBACK require positive Money; LOSS requires zero. REFUND/ROLLBACK require an external reference, WIN permits one, and BET/LOSS reject references. Malformed references and self-reference by external ID are rejected. OPENING and unknown kinds are rejected.
+
+Pointer methods `WaitForReference`, `MarkProcessed`, `Reject`, and `Fail` validate completely before changing status, failure code, or updatedAt. Failed attempts preserve the entire entity. PENDING can transition to PENDING_REFERENCE, PROCESSED, REJECTED, or FAILED. PENDING_REFERENCE can transition directly to PROCESSED, REJECTED, or FAILED. Waiting requires a declared reference. Terminal states and same-state transitions are rejected; there is no transition back to PENDING or public status setter. Nil/uninitialized entities reject transitions. Getters return values.
+
+Application-supplied processing timestamps must be non-zero and are normalized to UTC. No timestamp ordering is imposed; createdAt never changes. `MarkProcessed` validates lifecycle only: it does not validate references, wallet effects, or financial atomicity and does not mutate Wallet.
+
+FailureCode is distinct from Go validation errors. `Reject` accepts business codes `BET_INSUFFICIENT_FUNDS`, `REVERSAL_INSUFFICIENT_FUNDS`, and `REFERENCE_NOT_FOUND`; `Fail` accepts `PERMANENT_INFRASTRUCTURE_FAILURE`. This small catalog validates the business/infrastructure category, not code applicability to individual operation kinds. The application must select the appropriate outcome and classify infrastructure failures; temporary outages do not imply FAILED. Wrapped Money errors remain available through `errors.Is`.
+
+**Deferred:** OPENING, reference resolution and resolved internal reference ID, cross-transaction validation, idempotency/key storage, payload hashing, result balance/replay, persistence and rehydration, ledger, and outbox. No financial movement or event generation occurs here. Future application code must coordinate WagerTransaction, Wallet, Ledger, and Outbox atomically.
+
 ## Concurrency direction
 
 **Decided; not implemented.** Correctness must not rely on process-local locks or global locks. Coordination must work across multiple application instances, and independent wallets must be able to progress in parallel. The exact PostgreSQL locking strategy is not finalized.
@@ -83,7 +97,7 @@ Event contracts and snapshots, output destination, concurrent publisher coordina
 
 ### Reference and reversal processing — To be decided
 
-Transaction state transitions, durable pending-reference scheduling and expiration, reference validation, and policies preventing duplicate financial reversals.
+Durable pending-reference scheduling and expiration, reference resolution and validation, and policies preventing duplicate financial reversals. The local transaction state machine is implemented below.
 
 ### OAuth2/OIDC authorization — To be decided
 
