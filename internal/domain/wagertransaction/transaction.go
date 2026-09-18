@@ -36,6 +36,8 @@ const (
 type FailureCode string
 
 const (
+	CurrencyMismatch               FailureCode = "CURRENCY_MISMATCH"
+	MonetaryOverflow               FailureCode = "MONETARY_OVERFLOW"
 	BetInsufficientFunds           FailureCode = "BET_INSUFFICIENT_FUNDS"
 	ReversalInsufficientFunds      FailureCode = "REVERSAL_INSUFFICIENT_FUNDS"
 	ReferenceNotFound              FailureCode = "REFERENCE_NOT_FOUND"
@@ -210,7 +212,7 @@ func (t *WagerTransaction) transition(next Status, code FailureCode, at time.Tim
 	case PROCESSED:
 	case REJECTED:
 		switch code {
-		case BetInsufficientFunds, ReversalInsufficientFunds, ReferenceNotFound:
+		case BetInsufficientFunds, ReversalInsufficientFunds, ReferenceNotFound, CurrencyMismatch, MonetaryOverflow:
 		default:
 			return ErrInvalidFailureCode
 		}
@@ -232,7 +234,7 @@ func (t *WagerTransaction) transition(next Status, code FailureCode, at time.Tim
 
 func businessCode(code FailureCode) bool {
 	switch code {
-	case BetInsufficientFunds, ReversalInsufficientFunds, ReferenceNotFound:
+	case BetInsufficientFunds, ReversalInsufficientFunds, ReferenceNotFound, CurrencyMismatch, MonetaryOverflow:
 		return true
 	default:
 		return false

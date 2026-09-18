@@ -62,7 +62,7 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 	files, err := filepath.Glob("../../../migrations/*.up.sql")
-	if err != nil || len(files) != 2 {
+	if err != nil || len(files) != 3 {
 		t.Fatalf("migrations: %v %v", files, err)
 	}
 	for _, file := range files {
@@ -146,6 +146,10 @@ func TestRepositories(t *testing.T) {
 			var err error
 			tx, err = wt.NewExternal(wt.ExternalInput{ID: string(status), ProviderID: "provider", ExternalTransactionID: "external-" + string(status), PlayerID: w.PlayerID(), WalletID: w.ID(), RoundID: "round", GameID: "game", Kind: wt.REFUND, Money: testMoney(t, 1), ReferenceExternalTransactionID: "missing"}, testTime)
 			must(t, err)
+
+		}
+		must(t, tr.Insert(ctx, tx))
+		if status == wt.PENDING_REFERENCE {
 			must(t, tx.WaitForReference(testTime.Add(time.Second)))
 		}
 		if status == wt.PROCESSED {
@@ -157,7 +161,11 @@ func TestRepositories(t *testing.T) {
 		if status == wt.FAILED {
 			must(t, tx.Fail(wt.PermanentInfrastructureFailure, testTime.Add(time.Second)))
 		}
-		must(t, tr.Insert(ctx, tx))
+		if status == wt.PROCESSED || status == wt.REJECTED {
+			must(t, tr.CompleteOutcome(ctx, tx, wt.PENDING, w.Balance()))
+		} else if status != wt.PENDING {
+			must(t, tr.UpdateOutcome(ctx, tx, wt.PENDING))
+		}
 		got, err := tr.GetByID(ctx, tx.ID())
 		must(t, err)
 		if *got != *tx {
@@ -220,8 +228,8 @@ func TestRepositories(t *testing.T) {
 		t.Fatal("wallet update changed wrong fields")
 	}
 	must(t, tx.Reject(wt.BetInsufficientFunds, testTime.Add(time.Second)))
-	must(t, tr.UpdateOutcome(ctx, tx, wt.PENDING))
-	if err := tr.UpdateOutcome(ctx, tx, wt.PENDING); !errors.Is(err, ErrStaleOutcomeWrite) {
+	must(t, tr.CompleteOutcome(ctx, tx, wt.PENDING, w.Balance()))
+	if err := tr.CompleteOutcome(ctx, tx, wt.PENDING, w.Balance()); !errors.Is(err, ErrStaleOutcomeWrite) {
 		t.Fatal(err)
 	}
 	gotT, err := tr.GetByID(ctx, tx.ID())

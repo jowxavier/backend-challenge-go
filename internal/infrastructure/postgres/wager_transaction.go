@@ -5,6 +5,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jowxavier/backend-challenge-go/internal/application/financial"
 	wt "github.com/jowxavier/backend-challenge-go/internal/domain/wagertransaction"
 )
 
@@ -24,7 +25,7 @@ func optional(s string) any {
 }
 
 func (r *WagerTransactionRepository) Insert(ctx context.Context, t *wt.WagerTransaction) error {
-	if t == nil {
+	if t == nil || t.Status() == wt.PROCESSED || t.Status() == wt.REJECTED {
 		return wt.ErrInvalidTransaction
 	}
 	n, err := t.Money().MinorUnits()
@@ -35,7 +36,11 @@ func (r *WagerTransactionRepository) Insert(ctx context.Context, t *wt.WagerTran
 	if err != nil {
 		return err
 	}
-	_, err = r.db.Exec(ctx, `INSERT INTO wager_transactions (`+wagerColumns+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`, t.ID(), t.ProviderID(), t.ExternalTransactionID(), t.PlayerID(), t.WalletID(), t.RoundID(), t.GameID(), t.Kind(), n, c, optional(t.ReferenceExternalTransactionID()), t.Status(), optional(string(t.FailureCode())), t.CreatedAt(), t.UpdatedAt())
+	hash, err := financial.Fingerprint(financial.ProcessRequest{ProviderID: t.ProviderID(), ExternalTransactionID: t.ExternalTransactionID(), PlayerID: t.PlayerID(), WalletID: t.WalletID(), RoundID: t.RoundID(), GameID: t.GameID(), Kind: t.Kind(), Money: t.Money(), ReferenceExternalTransactionID: t.ReferenceExternalTransactionID()})
+	if err != nil {
+		return err
+	}
+	_, err = r.db.Exec(ctx, `INSERT INTO wager_transactions (`+wagerColumns+`,payload_hash) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`, t.ID(), t.ProviderID(), t.ExternalTransactionID(), t.PlayerID(), t.WalletID(), t.RoundID(), t.GameID(), t.Kind(), n, c, optional(t.ReferenceExternalTransactionID()), t.Status(), optional(string(t.FailureCode())), t.CreatedAt(), t.UpdatedAt(), hash[:])
 	return databaseError(err)
 }
 func (r *WagerTransactionRepository) GetByID(ctx context.Context, id string) (*wt.WagerTransaction, error) {
@@ -46,7 +51,12 @@ func (r *WagerTransactionRepository) GetByFinancialIdentity(ctx context.Context,
 }
 func (r *WagerTransactionRepository) UpdateOutcome(ctx context.Context, t *wt.WagerTransaction, expectedStatus wt.Status) error {
 	if t == nil {
-		return wt.ErrInvalidTransaction
+		return wt.ErrInvalidTransition
+	}
+	allowed := (expectedStatus == wt.PENDING && (t.Status() == wt.PENDING_REFERENCE || t.Status() == wt.FAILED)) ||
+		(expectedStatus == wt.PENDING_REFERENCE && t.Status() == wt.FAILED)
+	if !allowed {
+		return wt.ErrInvalidTransition
 	}
 	tag, err := r.db.Exec(ctx, `UPDATE wager_transactions SET status=$1, failure_code=$2, updated_at=$3 WHERE id=$4 AND status=$5`, t.Status(), optional(string(t.FailureCode())), t.UpdatedAt(), t.ID(), expectedStatus)
 	if err != nil {

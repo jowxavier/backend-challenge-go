@@ -7,16 +7,17 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jowxavier/backend-challenge-go/internal/application/financial"
 	"github.com/jowxavier/backend-challenge-go/internal/domain/money"
 )
 
 var (
-	ErrNotFound                   = errors.New("record not found")
+	ErrNotFound                   = financial.ErrNotFound
 	ErrDuplicateWalletIdentity    = errors.New("duplicate wallet identity")
 	ErrDuplicateFinancialIdentity = errors.New("duplicate financial identity")
 	ErrStaleWalletWrite           = errors.New("stale wallet write")
 	ErrStaleOutcomeWrite          = errors.New("stale transaction outcome write")
-	ErrInvalidPersistedData       = errors.New("invalid persisted data")
+	ErrInvalidPersistedData       = financial.ErrInvalidPersistedData
 	ErrTransactionRequired        = errors.New("existing transaction required")
 )
 

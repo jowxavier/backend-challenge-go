@@ -6,7 +6,7 @@ This living document records implemented architecture and agreed design decision
 
 **Decided; partially implemented.** The Go application is composed with Uber Fx. The domain must remain independent of Fx, HTTP, SQS, and persistence libraries. HTTP handlers and the SQS consumer will eventually call the same application use cases. Infrastructure adapters will implement interfaces required by the application/domain layers.
 
-Configuration, application composition, an HTTP server, the Money value object, the Wallet aggregate, and the WagerTransaction entity exist today. PostgreSQL repositories and transaction infrastructure are implemented. Other domain models, financial application use cases, and messaging components are not implemented yet.
+Configuration, application composition, an HTTP server, the Money value object, the Wallet aggregate, and the WagerTransaction entity exist today. PostgreSQL repositories and transaction infrastructure are implemented. The financial application processor and append-only ledger are implemented for BET, WIN without references, and LOSS. Messaging components are not implemented yet.
 
 ## Application composition and lifecycle
 
@@ -47,7 +47,7 @@ Amounts must be valid, non-negative Money in the wallet currency. Insufficient f
 
 Valid zero credits/debits are no-ops: balance, version, and timestamps remain unchanged, consistent with the README's balance-change version rule. Positive changes increment the version exactly once; version overflow is rejected. The application layer supplies processing timestamps, stored in UTC. Creation and balance-changing operations require non-zero timestamps. Timestamp ordering is not a Wallet invariant; earlier timestamps are accepted. Valid zero operations require no timestamp, but still validate the Wallet, Money, and currency. `createdAt` never changes.
 
-This checkpoint enforces only in-memory balance invariants and creates no ledger entries or events. Global uniqueness of `(playerId, currency)` is enforced by the initial schema. Durable ledger consistency and complete financial transaction orchestration remain **To be decided**. Repository locking is described below.
+This checkpoint enforces only in-memory balance invariants and creates no ledger entries or events. Global uniqueness of `(playerId, currency)` is enforced by the initial schema. The financial processor now commits balance changes together with ledger entries and saved outcomes for BET/WIN; messaging and the remaining operations are deferred. Repository locking is described below.
 
 ## WagerTransaction
 
@@ -59,9 +59,9 @@ Pointer methods `WaitForReference`, `MarkProcessed`, `Reject`, and `Fail` valida
 
 Application-supplied processing timestamps must be non-zero and are normalized to UTC. No timestamp ordering is imposed; createdAt never changes. `MarkProcessed` validates lifecycle only: it does not validate references, wallet effects, or financial atomicity and does not mutate Wallet.
 
-FailureCode is distinct from Go validation errors. `Reject` accepts business codes `BET_INSUFFICIENT_FUNDS`, `REVERSAL_INSUFFICIENT_FUNDS`, and `REFERENCE_NOT_FOUND`; `Fail` accepts `PERMANENT_INFRASTRUCTURE_FAILURE`. This small catalog validates the business/infrastructure category, not code applicability to individual operation kinds. The application must select the appropriate outcome and classify infrastructure failures; temporary outages do not imply FAILED. Wrapped Money errors remain available through `errors.Is`.
+FailureCode is distinct from Go validation errors. `Reject` accepts business codes `BET_INSUFFICIENT_FUNDS`, `REVERSAL_INSUFFICIENT_FUNDS`, `REFERENCE_NOT_FOUND`, `CURRENCY_MISMATCH`, and `MONETARY_OVERFLOW`; `Fail` accepts `PERMANENT_INFRASTRUCTURE_FAILURE`. This small catalog validates the business/infrastructure category, not code applicability to individual operation kinds. The application must select the appropriate outcome and classify infrastructure failures; temporary outages do not imply FAILED. Wrapped Money errors remain available through `errors.Is`.
 
-**Deferred:** OPENING, reference resolution and resolved internal reference ID, cross-transaction validation, idempotency/key storage, payload hashing, result balance/replay, ledger, and outbox. Initial persistence schema and explicit rehydration are implemented below. No financial movement or event generation occurs here. Future application code must coordinate WagerTransaction, Wallet, Ledger, and Outbox atomically.
+**Deferred:** OPENING, reference resolution and resolved internal reference ID, cross-transaction validation, and outbox. Application-owned persistence records now store fingerprints and replay balances, with keys in a separate binding table; these are not additional WagerTransaction domain fields. Initial persistence schema and explicit rehydration are implemented below. No financial movement or event generation occurs here. Future application code must coordinate WagerTransaction, Wallet, Ledger, and Outbox atomically.
 
 ## Persistence checkpoint 1
 
@@ -85,7 +85,7 @@ docker compose run --rm migrate up
 
 For an isolated up/down verification, use a separate Compose project and unused port consistently, for example `POSTGRES_PORT=55439 docker compose -p wager-persistence-check1 ...`. After applying both migrations, `run --rm migrate down 2` removes both application tables; apply `up` again to verify reversibility. `down` without `--volumes` stops that project's containers while retaining its database. Changing POSTGRES initialization settings does not rewrite an existing volume.
 
-PostgreSQL timestamp storage has microsecond precision; rehydration itself never truncates or replaces timestamps. Database adapters must handle UTC display and persistence precision explicitly. Repositories and per-wallet locking are implemented in checkpoint 2 below. Financial processing remains deferred.
+PostgreSQL timestamp storage has microsecond precision; rehydration itself never truncates or replaces timestamps. Database adapters must handle UTC display and persistence precision explicitly. Repositories and per-wallet locking are implemented in checkpoint 2 below. BET/WIN/LOSS financial processing is implemented in checkpoint 3 below.
 
 ## Persistence checkpoint 2
 
@@ -93,7 +93,7 @@ PostgreSQL timestamp storage has microsecond precision; rehydration itself never
 
 `Runner.WithinTransaction(ctx, callback)` owns a single READ COMMITTED pgx transaction. The callback receives Wallet and WagerTransaction repositories bound to that exact transaction. Success commits; callback errors roll back; commit errors are returned without retries or assumptions about replay safety. Cleanup uses a bounded context independent of request cancellation, also on panic. Rollback errors preserve the original error. Callback repositories must not escape or be used concurrently. A database rollback does not undo changes to in-memory domain objects.
 
-Wallet repository methods are Insert, GetByID, GetForUpdate, and UpdateBalance. GetForUpdate executes SELECT FOR UPDATE and refuses pool-only use. UpdateBalance changes only balance_minor, version, and updated_at, guarded by expectedVersion. WagerTransaction methods are Insert, GetByID, GetByFinancialIdentity, and UpdateOutcome; the latter changes only status, failure_code, and updated_at, guarded by expectedStatus. Zero affected rows produce the corresponding stale-write error (including a missing update target). Reads have a separate not-found error. No generic Save/Upsert/Delete operations are exposed.
+Wallet repository methods are Insert, GetByID, GetForUpdate, and UpdateBalance. GetForUpdate executes SELECT FOR UPDATE and refuses pool-only use. UpdateBalance changes only balance_minor, version, and updated_at, guarded by expectedVersion. WagerTransaction methods initially were Insert, GetByID, GetByFinancialIdentity, and UpdateOutcome. Checkpoint 3 requires a saved result for PROCESSED/REJECTED: these now use CompleteOutcome. Insert calculates the fingerprint and refuses direct PROCESSED/REJECTED insertion; UpdateOutcome is restricted to PENDING_REFERENCE/FAILED. Updates are guarded by expectedStatus. Zero affected rows produce the corresponding stale-write error (including a missing update target). Reads have a separate not-found error. No generic Save/Upsert/Delete operations are exposed.
 
 Constraint-specific infrastructure errors map `wallets_player_currency_unique` to duplicate wallet identity and `wager_financial_identity_unique` to duplicate financial identity. Other database violations, including primary-key collisions, retain their diagnostic cause without being misclassified. These errors are not domain business rejections.
 
@@ -111,19 +111,61 @@ export DATABASE_URL="$TEST_DATABASE_URL"
 go run ./cmd/api
 ```
 
-Ledger/outbox/inbox, financial orchestration, idempotency, reference processing, and multi-process financial scenarios remain deferred. No transaction retry or worker machinery is introduced.
+Checkpoint 3 implements ledger, financial orchestration, and idempotency below. Outbox/inbox, reference processing, and multi-process financial scenarios remain deferred. No transaction retry or worker machinery is introduced.
+
+## Persistence/application checkpoint 3
+
+**Implemented for BET, WIN without reference, and LOSS.** `internal/application/financial.Processor.Process(ctx, ProcessRequest)` is the shared transport-independent use case. Requests carry trusted provider identity, received idempotency key, external identity, player/wallet/round/game context, kind, immutable Money, and optional reference. Results contain transaction ID, status, optional failure code, optional saved balance, and replay indicator. The provider field is a trusted input contract, not implemented authentication. No HTTP/SQS adapter or new Fx wiring is added.
+
+The application owns narrow transaction/repository interfaces. `Runner.WithinFinancialTransaction` adapts the existing READ COMMITTED runner, binding every repository to its same pgx transaction. Domain code contains no pgx/Fx dependencies. Internal IDs use 128 random bits encoded as hex. Processing timestamps are application-generated UTC at PostgreSQL microsecond precision; no timestamp ordering invariant is added.
+
+### Identity, keys, and fingerprint
+
+`(provider_id, external_transaction_id)` remains the unique financial identity. `financial_idempotency_keys` permanently binds each `(provider_id, idempotency_key)` to a provider-consistent transaction FK. All accepted keys live here; there is no original-key column on wager_transactions. Same key and business payload replay. Reusing a key for another identity/payload conflicts. Another key for the same identity and payload is persisted as an alias and replays. Another key with changed payload conflicts. Bindings have database protection against UPDATE, DELETE, and TRUNCATE.
+
+The fingerprint is SHA-256 over canonical JSON produced by Go encoding/json from string-keyed maps: lexicographically ordered object keys, compact encoding, UTF-8, standard JSON and HTML escaping, and no newline. The exact bytes are covered by unit tests. Fields are externalTransactionId, gameId, kind, money (amount and currency), playerId, providerId, referenceExternalTransactionId, roundId, walletId. Absent reference is JSON null. Amount uses Money.Amount() with exactly two decimals; currency is uppercase. Validated identifiers are preserved without case conversion, trimming, or Unicode normalization. Keys, internal IDs, timestamps, and transport metadata are excluded. This canonicalization is a fixed persistence contract; changing it requires an explicit compatibility decision.
+
+Idempotency keys are non-empty valid UTF-8 strings without whitespace or control characters. Fingerprints and saved results belong to the application persistence Record, not the domain entity. The database stores the fingerprint as a 32-byte BYTEA.
+
+### Transaction and replay
+
+For a new operation, validate local input and hash before beginning. Inside the transaction: look up key, then financial identity; replay/conflict when found; lock the wallet with SELECT FOR UPDATE; validate player ownership; establish financial identity with targeted ON CONFLICT DO NOTHING; bind the key; calculate the domain operation; update the wallet with expectedVersion only if changed; insert a ledger entry only for movement; complete status and result with expectedStatus; commit. The wallet is locked before inserting its referencing transaction row to avoid foreign-key lock upgrade contention. Losing TryInsertExternal performs a new SELECT statement under READ COMMITTED before fingerprint comparison. Expected duplicate contention never relies on continuing after a unique-violation error.
+
+BET debits and WIN credits through Wallet. Successful movements increment version once and create exactly one DEBIT/CREDIT entry respectively. LOSS still locks and validates the wallet and saves its balance, but calls neither Debit nor Credit, performs no wallet UPDATE, preserves wallet timestamps/version, and creates no ledger. All successful operations become PROCESSED.
+
+Insufficient BET funds, incompatible currency, and monetary overflow commit REJECTED with BET_INSUFFICIENT_FUNDS, CURRENCY_MISMATCH, or MONETARY_OVERFLOW respectively, and the unchanged wallet balance. The callback returns nil for these business outcomes. Missing wallet/wrong player returns invalid context without accepting an operation or exposing a balance. Malformed inputs and unsupported kinds/references fail before financial acceptance. Wallet version exhaustion and infrastructure/integrity errors roll back rather than becoming REJECTED or FAILED.
+
+`result_balance_minor` and `result_currency` are saved on wager_transactions atomically with the terminal outcome. Currency is separate from requested currency because a currency-mismatch rejection returns the actual wallet balance. PROCESSED/REJECTED require a result; pending states forbid one. Replay reads only the persisted record, compares the fingerprint, binds a new alias when needed, and returns the saved outcome with IdempotentReplay=true. It does not reconstruct balance from Wallet or change terminal timestamps. Existing pending records are returned as pending, without processing them.
+
+Callback results remain provisional until commit succeeds. Any runner/commit error returns an empty ProcessResult and the error, without an automatic retry. An ambiguous commit can be reconciled later through persistent financial identity; a client must not bypass identity arbitration and directly repeat a mutation. No recovery worker is implemented, and transient failures are never automatically recorded as FAILED.
+
+### Ledger and database protection
+
+`internal/domain/ledger.Entry` is immutable, with validated identifiers, DEBIT/CREDIT direction, positive Money, same-currency non-negative before/after balances, exact arithmetic, and UTC creation time. Its zero value is rejected by persistence. `LedgerRepository` exposes Insert only.
+
+`wallet_ledger_entries` stores integer BIGINT amount/before/after values, explicit currency, and wallet/transaction references. Unique (wallet_id, transaction_id) prevents duplicate movement. A composite transaction/wallet FK enforces association, and a wallet/currency FK enforces currency. Arithmetic CHECKs subtract two non-negative balances, avoiding overflowing BIGINT addition. Database statement triggers reject UPDATE, DELETE, and TRUNCATE, including empty-table statements. Privileged schema owners can alter/disable protections; production runtime-role separation remains a deployment task. No double-entry accounting is implemented.
+
+Balance/ledger/outcome consistency is enforced by the application transaction plus row locks and database uniqueness/checks. Direct privileged SQL is not a supported financial write path. Reversal corrections will require new entries rather than editing existing entries.
+
+### Migration and verification scope
+
+Migration 000003 adds fingerprint/results, supporting composite keys, key bindings, ledger, database protections, and the two new rejection codes. Existing migrations are unchanged. UP explicitly requires an empty wager_transactions dataset: original keys and historical result balances cannot be fabricated from current balances. Use disposable development data or a new Compose volume/database; no automatic data deletion occurs. DOWN removes the new structures and refuses incompatible new rejection codes, with all DDL inside its SQL transaction.
+
+Integration fixtures apply all three migrations to isolated schemas. Tests cover financial outcomes and replay, key conflicts/aliases, schema constraints and append-only protection, real transaction rollback at multiple write stages, database-raised failure, independent-wallet progress, two concurrent BET 80.00 against 100.00, 50 distinct operations, 50 duplicate copies, and concurrent aliases. Synchronization uses channels and PostgreSQL lock observation rather than sleeps. UP/DOWN/UP and refusal of a populated legacy dataset are tested. Positive initial balances are fixtures; ledger assertions cover checkpoint deltas, not complete from-zero reconciliation without OPENING.
+
+Run all integration tests with the TEST_DATABASE_URL setup above, both normally and with -race. Three independent process verification is required later; concurrent connections/goroutines are not claimed as its substitute. REFUND/ROLLBACK/PENDING_REFERENCE processing, OPENING, outbox, inbox/SQS, HTTP financial endpoints, OAuth/OIDC, and recovery workers remain deferred. WIN references are explicitly unsupported by this processor. This checkpoint does not claim full challenge compliance or event-delivery guarantees.
 
 ## Concurrency direction
 
-**Implemented at repository level.** Wallet `GetForUpdate` uses PostgreSQL row locking within an existing READ COMMITTED transaction. No process-local or global locks provide correctness. Tests prove lock contention across independent connections; complete multi-instance financial correctness remains unimplemented.
+**Implemented at repository level.** Wallet `GetForUpdate` uses PostgreSQL row locking within an existing READ COMMITTED transaction. No process-local or global locks provide correctness. Tests prove lock contention and financial correctness across concurrent independent database transactions. Verification with three independent OS processes remains deferred.
 
 ## Future decisions
 
-The following mechanisms are required by the challenge, but their designs have not been selected.
+The following mechanisms remain incomplete; implemented checkpoint decisions above take precedence.
 
 ### PostgreSQL transaction boundaries — To be decided
 
-pgx, application-owned transaction callbacks, and READ COMMITTED are implemented. Atomic grouping of wallet state, transactions, ledger, inbox, and outbox in financial application processing remains deferred.
+pgx, application-owned transaction callbacks, and READ COMMITTED are implemented. Wallet, transaction, ledger, key bindings, and saved results are now grouped atomically. Inbox/outbox integration remains deferred.
 
 ### Wallet concurrency control — To be decided
 
@@ -131,11 +173,11 @@ Per-wallet SELECT FOR UPDATE and expected-version guards are implemented. Lock o
 
 ### Persistent idempotency — To be decided
 
-Schema and uniqueness rules, deterministic payload hashing and normalization shared by HTTP/SQS, conflict handling, and storage of original results for replay.
+Implemented for the shared financial processor above; transport integration and recovery policy remain deferred.
 
 ### Ledger persistence and immutability — To be decided
 
-Schema, database protections against edits/deletions, financial constraints, opening entries, and consistent reconciliation reads.
+Schema, immutable entries, and database protections are implemented above. Opening entries and consistent reconciliation reads remain deferred.
 
 ### Inbox processing — To be decided
 
