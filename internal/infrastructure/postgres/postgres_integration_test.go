@@ -62,7 +62,7 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 	files, err := filepath.Glob("../../../migrations/*.up.sql")
-	if err != nil || len(files) != 3 {
+	if err != nil || len(files) != 4 {
 		t.Fatalf("migrations: %v %v", files, err)
 	}
 	for _, file := range files {
@@ -163,6 +163,8 @@ func TestRepositories(t *testing.T) {
 		}
 		if status == wt.PROCESSED || status == wt.REJECTED {
 			must(t, tr.CompleteOutcome(ctx, tx, wt.PENDING, w.Balance()))
+		} else if status == wt.PENDING_REFERENCE {
+			must(t, tr.MarkPendingReference(ctx, tx, testTime.Add(24*time.Hour)))
 		} else if status != wt.PENDING {
 			must(t, tr.UpdateOutcome(ctx, tx, wt.PENDING))
 		}

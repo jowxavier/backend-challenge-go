@@ -9,7 +9,10 @@ import (
 	wt "github.com/jowxavier/backend-challenge-go/internal/domain/wagertransaction"
 )
 
-type WagerTransactionRepository struct{ db db }
+type WagerTransactionRepository struct {
+	db db
+	tx pgx.Tx
+}
 
 func NewWagerTransactionRepository(pool *pgxpool.Pool) *WagerTransactionRepository {
 	return &WagerTransactionRepository{db: pool}

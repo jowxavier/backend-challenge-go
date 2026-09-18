@@ -6,7 +6,7 @@ This living document records implemented architecture and agreed design decision
 
 **Decided; partially implemented.** The Go application is composed with Uber Fx. The domain must remain independent of Fx, HTTP, SQS, and persistence libraries. HTTP handlers and the SQS consumer will eventually call the same application use cases. Infrastructure adapters will implement interfaces required by the application/domain layers.
 
-Configuration, application composition, an HTTP server, the Money value object, the Wallet aggregate, and the WagerTransaction entity exist today. PostgreSQL repositories and transaction infrastructure are implemented. The financial application processor and append-only ledger are implemented for BET, WIN without references, and LOSS. Messaging components are not implemented yet.
+Configuration, application composition, an HTTP server, the Money value object, the Wallet aggregate, and the WagerTransaction entity exist today. PostgreSQL repositories and transaction infrastructure are implemented. The financial application processor and append-only ledger implement BET, WIN, LOSS, REFUND and ROLLBACK, including explicit pending-reference resolution. Messaging components are not implemented yet.
 
 ## Application composition and lifecycle
 
@@ -59,9 +59,9 @@ Pointer methods `WaitForReference`, `MarkProcessed`, `Reject`, and `Fail` valida
 
 Application-supplied processing timestamps must be non-zero and are normalized to UTC. No timestamp ordering is imposed; createdAt never changes. `MarkProcessed` validates lifecycle only: it does not validate references, wallet effects, or financial atomicity and does not mutate Wallet.
 
-FailureCode is distinct from Go validation errors. `Reject` accepts business codes `BET_INSUFFICIENT_FUNDS`, `REVERSAL_INSUFFICIENT_FUNDS`, `REFERENCE_NOT_FOUND`, `CURRENCY_MISMATCH`, and `MONETARY_OVERFLOW`; `Fail` accepts `PERMANENT_INFRASTRUCTURE_FAILURE`. This small catalog validates the business/infrastructure category, not code applicability to individual operation kinds. The application must select the appropriate outcome and classify infrastructure failures; temporary outages do not imply FAILED. Wrapped Money errors remain available through `errors.Is`.
+FailureCode is distinct from Go validation errors. `Reject` accepts business codes `BET_INSUFFICIENT_FUNDS`, `REVERSAL_INSUFFICIENT_FUNDS`, `REFERENCE_NOT_FOUND`, `CURRENCY_MISMATCH`, and `MONETARY_OVERFLOW`, `REFERENCE_NOT_ALLOWED`, `REFERENCE_MISMATCH`, `REFERENCE_UNSUCCESSFUL`, and `ALREADY_REVERSED`; `Fail` accepts `PERMANENT_INFRASTRUCTURE_FAILURE`. This small catalog validates the business/infrastructure category, not code applicability to individual operation kinds. The application must select the appropriate outcome and classify infrastructure failures; temporary outages do not imply FAILED. Wrapped Money errors remain available through `errors.Is`.
 
-**Deferred:** OPENING, reference resolution and resolved internal reference ID, cross-transaction validation, and outbox. Application-owned persistence records now store fingerprints and replay balances, with keys in a separate binding table; these are not additional WagerTransaction domain fields. Initial persistence schema and explicit rehydration are implemented below. No financial movement or event generation occurs here. Future application code must coordinate WagerTransaction, Wallet, Ledger, and Outbox atomically.
+**Deferred:** OPENING and outbox. Reference resolution, internal reference IDs, and cross-transaction validation are implemented in checkpoint 4 below. Application-owned persistence records now store fingerprints and replay balances, with keys in a separate binding table; these are not additional WagerTransaction domain fields. Initial persistence schema and explicit rehydration are implemented below. No financial movement or event generation occurs here. Future application code must coordinate WagerTransaction, Wallet, Ledger, and Outbox atomically.
 
 ## Persistence checkpoint 1
 
@@ -111,7 +111,7 @@ export DATABASE_URL="$TEST_DATABASE_URL"
 go run ./cmd/api
 ```
 
-Checkpoint 3 implements ledger, financial orchestration, and idempotency below. Outbox/inbox, reference processing, and multi-process financial scenarios remain deferred. No transaction retry or worker machinery is introduced.
+Checkpoint 3 implements ledger, financial orchestration, and idempotency below. Outbox/inbox and multi-process financial scenarios remain deferred. Reference processing is implemented in checkpoint 4 below. No transaction retry or worker machinery is introduced.
 
 ## Persistence/application checkpoint 3
 
@@ -153,7 +153,48 @@ Migration 000003 adds fingerprint/results, supporting composite keys, key bindin
 
 Integration fixtures apply all three migrations to isolated schemas. Tests cover financial outcomes and replay, key conflicts/aliases, schema constraints and append-only protection, real transaction rollback at multiple write stages, database-raised failure, independent-wallet progress, two concurrent BET 80.00 against 100.00, 50 distinct operations, 50 duplicate copies, and concurrent aliases. Synchronization uses channels and PostgreSQL lock observation rather than sleeps. UP/DOWN/UP and refusal of a populated legacy dataset are tested. Positive initial balances are fixtures; ledger assertions cover checkpoint deltas, not complete from-zero reconciliation without OPENING.
 
-Run all integration tests with the TEST_DATABASE_URL setup above, both normally and with -race. Three independent process verification is required later; concurrent connections/goroutines are not claimed as its substitute. REFUND/ROLLBACK/PENDING_REFERENCE processing, OPENING, outbox, inbox/SQS, HTTP financial endpoints, OAuth/OIDC, and recovery workers remain deferred. WIN references are explicitly unsupported by this processor. This checkpoint does not claim full challenge compliance or event-delivery guarantees.
+Run all integration tests with the TEST_DATABASE_URL setup above, both normally and with -race. Three independent process verification is required later; concurrent connections/goroutines are not claimed as its substitute. Checkpoint 4 extends this processor with reference operations below. OPENING, outbox, inbox/SQS, HTTP financial endpoints, OAuth/OIDC, and recovery workers remain deferred. This checkpoint does not claim full challenge compliance or event-delivery guarantees.
+
+## Persistence/application checkpoint 4
+
+**Implemented.** The existing processor accepts REFUND, ROLLBACK and reference-bearing WIN. `ResolvePendingReference(ctx, providerID, transactionID)` reuses its financial execution path and persisted original request. It does not accept replacement money, payload, reference, or key. A terminal operation returns its saved result; unexpected PENDING is an integrity error. Provider-scoped not-found behavior prevents cross-provider disclosure. There is no automatic progression until a future worker invokes this method.
+
+### Reference rules
+
+References are resolved only by (provider_id, reference_external_transaction_id), using the existing unique index. An ID present only under another provider is absent for this operation. Both transactions must agree in provider, player, wallet, currency, and round. gameId equality is deliberately not required. Wallet ownership/currency checks still apply independently of reference validation.
+
+| Operation | Eligible PROCESSED reference | Amount | Movement |
+| --- | --- | --- | --- |
+| REFUND | BET | Exact full original amount | CREDIT |
+| ROLLBACK | BET | Exact full original amount | CREDIT |
+| ROLLBACK | WIN or REFUND | Exact full original amount | DEBIT |
+| WIN with reference | BET | Independent positive amount | CREDIT |
+
+LOSS and ROLLBACK cannot be rollback targets. Multiple distinct WINs may reference a BET, including one already reversed; WIN does not consume reversal exclusivity. A referenced operation with invalid kind/context is rejected immediately, even if nonterminal. A compatible PENDING/PENDING_REFERENCE target causes waiting; REJECTED/FAILED causes REFERENCE_UNSUCCESSFUL. Partial reversals are rejected with REFERENCE_MISMATCH. Other stable codes are REFERENCE_NOT_ALLOWED and ALREADY_REVERSED. Existing REVERSAL_INSUFFICIENT_FUNDS, MONETARY_OVERFLOW, CURRENCY_MISMATCH and REFERENCE_NOT_FOUND retain their meanings. Version exhaustion remains an error with rollback, not a business rejection.
+
+### Pending lifecycle and time
+
+The processor receives a positive TTL and an injected `func() time.Time` through its constructor. Config.Load parses REFERENCE_PENDING_TTL (default 24h) and rejects empty, malformed, zero, or negative durations. cmd/api registers a constructor supplying the configured TTL and time.Now. The application samples processing time through its injected clock, in UTC at microsecond precision; resolution samples after acquiring locks.
+
+The first PENDING -> PENDING_REFERENCE transition atomically stores reference_deadline_at = processing time + TTL, the financial identity, and key bindings. It creates no wallet update, ledger, or saved balance. Replay/aliases do not resolve the operation or extend its deadline. Unsuccessful pre-deadline resolution leaves the pending row and deadline unchanged; WaitForReference is not called again. At or after the deadline, resolution commits REJECTED/REFERENCE_NOT_FOUND even if the reference is now available. The deadline is retained after completion. No retry counters, leases, scheduling columns, polling or worker exist.
+
+### Locks, completion and exclusivity
+
+New requests keep the checkpoint 3 order: key/identity reads, wallet FOR UPDATE, identity/binding establishment, reference evaluation, financial writes and outcome. Resolution reads the operation without a lock to discover the wallet, locks that wallet, then locks/re-reads the operation and checks its current status/deadline. References are read without FOR UPDATE; terminal records remain immutable and valid operations for that wallet serialize on its wallet lock. Invalid cross-wallet references are rejected without locking the other wallet.
+
+A successfully validated PROCESSED reference's internal ID is persisted before financial completion, within the same transaction. The FK includes provider, external reference and internal ID, preventing inconsistent identity mappings. Reference metadata is application persistence state and is excluded from the original fingerprint. CompleteOutcome remains guarded and commits status, failure code and historical result together. MarkPendingReference is the narrow guarded operation for the initial pending transition with its deadline; the legacy UpdateOutcome guard is unchanged and cannot supply a missing deadline.
+
+A partial unique index on (provider_id, reference_external_transaction_id), restricted to PROCESSED REFUND/ROLLBACK, permits at most one successful reversal across both types. Under the wallet lock, the application checks existing successful reversals before movement and commits ALREADY_REVERSED for the loser. An unexpected SQL constraint failure rolls back; processing never continues in an aborted transaction. Rejected reversals do not consume exclusivity.
+
+ROLLBACK(REFUND) debits the refunded amount but never changes historical audit records or reopens reversal permission for the original BET. Every successful movement has one new ledger entry and one wallet version increment. Pending and rejected operations have no movement. Replay uses the historical terminal balance and never recalculates it from the wallet.
+
+### Schema and verification
+
+Migration 000004 adds reference_transaction_id, reference_deadline_at, provider/external/internal reference consistency, self-reference and terminal-reference constraints, the partial unique index, and the new failure codes. It neither deletes nor rewrites checkpoint 3 financial history. DOWN refuses existing reference metadata/new codes rather than silently discarding resolution history; UP/DOWN/UP is verified against preserved checkpoint 3 records. No earlier migration is rewritten.
+
+Tests cover reference directions, contextual validation, provider isolation, pending/terminal references, aliases, strict expiration with an injected clock, historical replay, rollback of resolver failures, and the independent database uniqueness constraint. Channel barriers and observed PostgreSQL lock dependencies exercise competing reversals, two resolvers, replay versus resolver, and original versus reversal in both lock orders. Goroutines are cancelled and joined before cleanup; no sleeps establish correctness. Checkpoint 3 regression scenarios remain in the integration suite.
+
+HTTP, SQS/inbox, outbox, OAuth/OIDC, Keycloak, OPENING, background resolution/backoff, recovery workers and three-process verification remain deferred. This is not complete challenge compliance.
 
 ## Concurrency direction
 
@@ -189,7 +230,7 @@ Event contracts and snapshots, output destination, concurrent publisher coordina
 
 ### Reference and reversal processing — To be decided
 
-Durable pending-reference scheduling and expiration, reference resolution and validation, and policies preventing duplicate financial reversals. The local transaction state machine is implemented below.
+Reference resolution, strict expiration, and reversal exclusivity are implemented below. Automatic scheduling/backoff and the background resolver remain deferred.
 
 ### OAuth2/OIDC authorization — To be decided
 

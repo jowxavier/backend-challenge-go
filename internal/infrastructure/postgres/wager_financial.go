@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jowxavier/backend-challenge-go/internal/application/financial"
@@ -9,7 +10,7 @@ import (
 	wt "github.com/jowxavier/backend-challenge-go/internal/domain/wagertransaction"
 )
 
-const financialColumns = wagerColumns + ", payload_hash, result_balance_minor, result_currency"
+const financialColumns = wagerColumns + ", payload_hash, result_balance_minor, result_currency, reference_transaction_id, reference_deadline_at"
 
 func (r *WagerTransactionRepository) FindFinancial(ctx context.Context, provider, external string) (financial.Record, error) {
 	return scanFinancial(r.db.QueryRow(ctx, `SELECT `+financialColumns+` FROM wager_transactions WHERE provider_id=$1 AND external_transaction_id=$2`, provider, external))
@@ -66,7 +67,9 @@ func scanFinancial(row pgx.Row) (financial.Record, error) {
 	var reference, code, resultCurrency *string
 	var hash []byte
 	var balance *int64
-	if err := row.Scan(&s.ID, &s.ProviderID, &s.ExternalTransactionID, &s.PlayerID, &s.WalletID, &s.RoundID, &s.GameID, &s.Kind, &n, &c, &reference, &s.Status, &code, &s.CreatedAt, &s.UpdatedAt, &hash, &balance, &resultCurrency); err != nil {
+	var referenceID *string
+	var deadline *time.Time
+	if err := row.Scan(&s.ID, &s.ProviderID, &s.ExternalTransactionID, &s.PlayerID, &s.WalletID, &s.RoundID, &s.GameID, &s.Kind, &n, &c, &reference, &s.Status, &code, &s.CreatedAt, &s.UpdatedAt, &hash, &balance, &resultCurrency, &referenceID, &deadline); err != nil {
 		return financial.Record{}, scanError(err)
 	}
 	if reference != nil {
@@ -95,7 +98,23 @@ func scanFinancial(row pgx.Row) (financial.Record, error) {
 	if len(hash) != 32 || (balance == nil) != (resultCurrency == nil) {
 		return financial.Record{}, persistedError(financial.ErrInvalidPersistedData)
 	}
-	record := financial.Record{Transaction: t, PayloadHash: [32]byte(hash)}
+	record := financial.Record{Transaction: t, PayloadHash: [32]byte(hash), ReferenceDeadline: deadline}
+	if referenceID != nil {
+		if *referenceID == "" || *referenceID == t.ID() || t.ReferenceExternalTransactionID() == "" {
+			return financial.Record{}, persistedError(wt.ErrInvalidReference)
+		}
+		record.ReferenceTransactionID = *referenceID
+	}
+	if deadline != nil {
+		d := deadline.UTC()
+		record.ReferenceDeadline = &d
+		if d.IsZero() || t.ReferenceExternalTransactionID() == "" {
+			return financial.Record{}, persistedError(wt.ErrInvalidTime)
+		}
+	}
+	if (t.Status() == wt.PENDING_REFERENCE && deadline == nil) || (t.Status() == wt.PROCESSED && t.ReferenceExternalTransactionID() != "" && referenceID == nil) {
+		return financial.Record{}, persistedError(wt.ErrInvalidReference)
+	}
 	if balance != nil {
 		m, err := persistedMoney(*balance, *resultCurrency)
 		if err != nil {

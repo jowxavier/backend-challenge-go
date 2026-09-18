@@ -33,9 +33,9 @@ func TestUnconfirmedCommitDiscardsResult(t *testing.T) {
 	hash, _ := Fingerprint(req)
 	sentinel := errors.New("commit outcome unknown")
 	calls := 0
-	p := NewProcessor(transactionFunc(func(ctx context.Context, work func(Repositories) error) error {
+	p := testProcessor(t, transactionFunc(func(ctx context.Context, work func(Repositories) error) error {
 		calls++
-		if err := work(Repositories{Keys: replayKeys{Record{tx, hash, &m}}}); err != nil {
+		if err := work(Repositories{Keys: replayKeys{Record{Transaction: tx, PayloadHash: hash, Balance: &m}}}); err != nil {
 			return err
 		}
 		return sentinel
@@ -48,7 +48,7 @@ func TestUnconfirmedCommitDiscardsResult(t *testing.T) {
 func TestInputRejectedBeforeTransaction(t *testing.T) {
 	m, _ := money.Parse("1", "BRL")
 	base := ProcessRequest{ProviderID: "p", IdempotencyKey: "k", ExternalTransactionID: "e", PlayerID: "u", WalletID: "w", RoundID: "r", GameID: "g", Kind: wt.BET, Money: m}
-	p := NewProcessor(transactionFunc(func(context.Context, func(Repositories) error) error {
+	p := testProcessor(t, transactionFunc(func(context.Context, func(Repositories) error) error {
 		t.Fatal("transaction started for invalid input")
 		return nil
 	}))
@@ -59,7 +59,7 @@ func TestInputRejectedBeforeTransaction(t *testing.T) {
 		{"refund", func(r *ProcessRequest) { r.Kind = wt.REFUND }},
 		{"rollback", func(r *ProcessRequest) { r.Kind = wt.ROLLBACK }},
 		{"opening", func(r *ProcessRequest) { r.Kind = "OPENING" }},
-		{"win reference", func(r *ProcessRequest) { r.Kind = wt.WIN; r.ReferenceExternalTransactionID = "reference" }},
+		{"self reference", func(r *ProcessRequest) { r.Kind = wt.WIN; r.ReferenceExternalTransactionID = r.ExternalTransactionID }},
 		{"key", func(r *ProcessRequest) { r.IdempotencyKey = "" }},
 		{"money", func(r *ProcessRequest) { r.Money = money.Money{} }},
 		{"player", func(r *ProcessRequest) { r.PlayerID = "" }},
@@ -74,4 +74,13 @@ func TestInputRejectedBeforeTransaction(t *testing.T) {
 			}
 		})
 	}
+}
+
+func testProcessor(t *testing.T, tr Transactor) *Processor {
+	t.Helper()
+	p, err := NewProcessor(tr, 24*time.Hour, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
 }

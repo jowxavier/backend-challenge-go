@@ -68,7 +68,7 @@ func TestFinancialOutcomes(t *testing.T) {
 			must(t, NewWalletRepository(pool).Insert(ctx, w))
 			req := request(t, "op", "w", tc.kind, tc.amount)
 			req.Money, _ = money.FromMinorUnits(tc.amount, tc.currency)
-			p := financial.NewProcessor(NewRunner(pool))
+			p := newProcessor(t, NewRunner(pool))
 			result, err := p.Process(ctx, req)
 			must(t, err)
 			assertBalance(t, result, tc.want)
@@ -145,7 +145,7 @@ func TestFinancialContextAndCapacity(t *testing.T) {
 			}
 			before, err := NewWalletRepository(pool).GetByID(ctx, "w")
 			must(t, err)
-			result, err := financial.NewProcessor(NewRunner(pool)).Process(ctx, req)
+			result, err := newProcessor(t, NewRunner(pool)).Process(ctx, req)
 			if !errors.Is(err, want) || result != (financial.ProcessResult{}) {
 				t.Fatal(result, err)
 			}
@@ -167,7 +167,7 @@ func TestFinancialReplayAndConflicts(t *testing.T) {
 	pool := testPool(t)
 	ctx := testContext(t)
 	must(t, NewWalletRepository(pool).Insert(ctx, testWallet(t, "w", 10000)))
-	p := financial.NewProcessor(NewRunner(pool))
+	p := newProcessor(t, NewRunner(pool))
 	req := request(t, "bet", "w", wt.BET, 8000)
 	original, err := p.Process(ctx, req)
 	must(t, err)
@@ -176,7 +176,7 @@ func TestFinancialReplayAndConflicts(t *testing.T) {
 	var updated time.Time
 	must(t, pool.QueryRow(ctx, `SELECT updated_at FROM wager_transactions WHERE id=$1`, original.TransactionID).Scan(&updated))
 	// A fresh processor must replay durable history rather than current wallet state.
-	p = financial.NewProcessor(NewRunner(pool))
+	p = newProcessor(t, NewRunner(pool))
 	for _, key := range []string{req.IdempotencyKey, "alias"} {
 		r := req
 		r.IdempotencyKey = key
@@ -320,7 +320,7 @@ func TestFinancialRollback(t *testing.T) {
 			ctx := testContext(t)
 			w := testWallet(t, "w", 10000)
 			must(t, NewWalletRepository(pool).Insert(ctx, w))
-			p := financial.NewProcessor(faultRunner{NewRunner(pool), stage})
+			p := newProcessor(t, faultRunner{NewRunner(pool), stage})
 			got, err := p.Process(ctx, request(t, "op", "w", wt.BET, 8000))
 			if !errors.Is(err, injected) || got != (financial.ProcessResult{}) {
 				t.Fatal(got, err)
@@ -345,7 +345,7 @@ func TestLedgerDatabaseConstraints(t *testing.T) {
 	wr := NewWalletRepository(pool)
 	must(t, wr.Insert(ctx, testWallet(t, "w", 10000)))
 	must(t, wr.Insert(ctx, testWallet(t, "other", 10000)))
-	p := financial.NewProcessor(NewRunner(pool))
+	p := newProcessor(t, NewRunner(pool))
 	result, err := p.Process(ctx, request(t, "op", "w", wt.BET, 8000))
 	must(t, err)
 	beforeLedger := ledgerSnapshot(t, pool)
@@ -402,7 +402,7 @@ func runConcurrent(t *testing.T, pool *pgxpool.Pool, requests []financial.Proces
 	for _, req := range requests {
 		go func() {
 			<-start
-			r, err := financial.NewProcessor(NewRunner(pool)).Process(ctx, req)
+			r, err := newProcessor(t, NewRunner(pool)).Process(ctx, req)
 			done <- concurrentResult{r, err}
 		}()
 	}
@@ -478,7 +478,7 @@ func TestFinancialConcurrency(t *testing.T) {
 				t.Fatal(negative, duplicates)
 			}
 			for _, req := range requests {
-				_, err := financial.NewProcessor(NewRunner(pool)).Process(ctx, req)
+				_, err := newProcessor(t, NewRunner(pool)).Process(ctx, req)
 				must(t, err)
 			}
 			after, err := NewWalletRepository(pool).GetByID(ctx, "w")
@@ -512,7 +512,7 @@ func TestIndependentWallets(t *testing.T) {
 	reqA := request(t, "a", "a", wt.BET, 1)
 	go func() {
 		defer close(joined)
-		r, err := financial.NewProcessor(NewRunner(pool)).Process(waiterCtx, reqA)
+		r, err := newProcessor(t, NewRunner(pool)).Process(waiterCtx, reqA)
 		done <- concurrentResult{r, err}
 	}()
 	pid := int(first.Conn().PgConn().PID())
@@ -528,7 +528,7 @@ func TestIndependentWallets(t *testing.T) {
 		default:
 		}
 	}
-	b, err := financial.NewProcessor(NewRunner(pool)).Process(ctx, request(t, "b", "b", wt.BET, 1))
+	b, err := newProcessor(t, NewRunner(pool)).Process(ctx, request(t, "b", "b", wt.BET, 1))
 	must(t, err)
 	assertBalance(t, b, 99)
 	must(t, first.Commit(ctx))
@@ -540,6 +540,10 @@ func TestIndependentWallets(t *testing.T) {
 func TestFinancialMigrationRoundTrip(t *testing.T) {
 	pool := testPool(t)
 	ctx := testContext(t)
+	down4, err := os.ReadFile("../../../migrations/000004_references.down.sql")
+	must(t, err)
+	_, err = pool.Exec(ctx, string(down4))
+	must(t, err)
 	down, err := os.ReadFile("../../../migrations/000003_financial_core.down.sql")
 	must(t, err)
 	up, err := os.ReadFile("../../../migrations/000003_financial_core.up.sql")
@@ -600,7 +604,7 @@ func TestReplayDoesNotLockWallet(t *testing.T) {
 	pool := testPool(t)
 	ctx := testContext(t)
 	must(t, NewWalletRepository(pool).Insert(ctx, testWallet(t, "w", 10000)))
-	p := financial.NewProcessor(NewRunner(pool))
+	p := newProcessor(t, NewRunner(pool))
 	req := request(t, "op", "w", wt.BET, 8000)
 	_, err := p.Process(ctx, req)
 	must(t, err)
@@ -629,7 +633,7 @@ func TestDatabaseFailureRollsBackFinancialOperation(t *testing.T) {
 	must(t, NewWalletRepository(pool).Insert(ctx, w))
 	_, err := pool.Exec(ctx, `CREATE FUNCTION fail_ledger_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected database failure'; END $$; CREATE TRIGGER fail_insert BEFORE INSERT ON wallet_ledger_entries FOR EACH STATEMENT EXECUTE FUNCTION fail_ledger_insert()`)
 	must(t, err)
-	result, err := financial.NewProcessor(NewRunner(pool)).Process(ctx, request(t, "op", "w", wt.BET, 8000))
+	result, err := newProcessor(t, NewRunner(pool)).Process(ctx, request(t, "op", "w", wt.BET, 8000))
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || result != (financial.ProcessResult{}) {
 		t.Fatal(result, err)
@@ -644,4 +648,11 @@ func TestDatabaseFailureRollsBackFinancialOperation(t *testing.T) {
 			t.Fatal(table)
 		}
 	}
+}
+
+func newProcessor(t *testing.T, tr financial.Transactor) *financial.Processor {
+	t.Helper()
+	p, err := financial.NewProcessor(tr, 24*time.Hour, time.Now)
+	must(t, err)
+	return p
 }

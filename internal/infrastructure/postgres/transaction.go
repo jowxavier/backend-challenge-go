@@ -34,7 +34,7 @@ func (r *Runner) WithinTransaction(ctx context.Context, work func(*Repositories)
 			err = errors.Join(err, fmt.Errorf("rollback transaction: %w", rbErr))
 		}
 	}()
-	repos := &Repositories{Wallets: &WalletRepository{db: tx, tx: tx}, WagerTransactions: &WagerTransactionRepository{db: tx}}
+	repos := &Repositories{Wallets: &WalletRepository{db: tx, tx: tx}, WagerTransactions: &WagerTransactionRepository{db: tx, tx: tx}}
 	if err = work(repos); err != nil {
 		return err
 	}

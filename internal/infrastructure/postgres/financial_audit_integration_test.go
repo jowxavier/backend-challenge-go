@@ -61,7 +61,7 @@ func TestUpdateOutcomeTerminalProtection(t *testing.T) {
 				if status == wt.REJECTED {
 					amount = 20000
 				}
-				result, err := financial.NewProcessor(NewRunner(pool)).Process(ctx, request(t, "op", "w", wt.BET, amount))
+				result, err := newProcessor(t, NewRunner(pool)).Process(ctx, request(t, "op", "w", wt.BET, amount))
 				must(t, err)
 				id = result.TransactionID
 			}
@@ -105,9 +105,16 @@ func TestUpdateOutcomeTransitionPairs(t *testing.T) {
 				ctx := testContext(t)
 				must(t, NewWalletRepository(pool).Insert(ctx, testWallet(t, "w", 100)))
 				tr := NewWagerTransactionRepository(pool)
-				initial := outcomeFixture(t, "t", source)
+				initial := outcomeFixture(t, "t", wt.PENDING)
 				must(t, tr.Insert(ctx, initial))
-				must(t, tr.UpdateOutcome(ctx, outcomeFixture(t, "t", destination), source))
+				if source == wt.PENDING_REFERENCE {
+					must(t, tr.MarkPendingReference(ctx, outcomeFixture(t, "t", source), testTime.Add(24*time.Hour)))
+				}
+				if destination == wt.PENDING_REFERENCE {
+					must(t, tr.MarkPendingReference(ctx, outcomeFixture(t, "t", destination), testTime.Add(24*time.Hour)))
+				} else {
+					must(t, tr.UpdateOutcome(ctx, outcomeFixture(t, "t", destination), source))
+				}
 				got, err := tr.GetByID(ctx, "t")
 				must(t, err)
 				if got.Status() != destination {
@@ -233,12 +240,12 @@ func TestDeterministicFinancialRaces(t *testing.T) {
 			firstJoined, secondJoined := make(chan struct{}), make(chan struct{})
 			go func() {
 				defer close(firstJoined)
-				r, e := financial.NewProcessor(winner).Process(ctx, firstReq)
+				r, e := newProcessor(t, winner).Process(ctx, firstReq)
 				firstDone <- concurrentResult{r, e}
 			}()
 			go func() {
 				defer close(secondJoined)
-				r, e := financial.NewProcessor(loser).Process(ctx, secondReq)
+				r, e := newProcessor(t, loser).Process(ctx, secondReq)
 				secondDone <- concurrentResult{r, e}
 			}()
 			defer func() { cancel(); <-firstJoined; <-secondJoined }()

@@ -3,11 +3,13 @@ package config
 import (
 	"fmt"
 	"os"
+	"time"
 )
 
 type Config struct {
-	HTTP        HTTPConfig
-	DatabaseURL string
+	HTTP                HTTPConfig
+	DatabaseURL         string
+	ReferencePendingTTL time.Duration
 }
 
 type HTTPConfig struct {
@@ -32,6 +34,11 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("HTTP_PORT cannot be empty")
 	}
 
+	ttl, err := time.ParseDuration(getEnv("REFERENCE_PENDING_TTL", "24h"))
+	if err != nil || ttl <= 0 {
+		return nil, fmt.Errorf("REFERENCE_PENDING_TTL must be a positive duration")
+	}
+	cfg.ReferencePendingTTL = ttl
 	return cfg, nil
 }
 

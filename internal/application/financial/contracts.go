@@ -3,6 +3,7 @@ package financial
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/jowxavier/backend-challenge-go/internal/domain/ledger"
 	"github.com/jowxavier/backend-challenge-go/internal/domain/money"
@@ -36,9 +37,11 @@ type ProcessResult struct {
 }
 
 type Record struct {
-	Transaction *wt.WagerTransaction
-	PayloadHash [32]byte
-	Balance     *money.Money
+	Transaction            *wt.WagerTransaction
+	PayloadHash            [32]byte
+	Balance                *money.Money
+	ReferenceTransactionID string
+	ReferenceDeadline      *time.Time
 }
 
 type Wallets interface {
@@ -47,6 +50,11 @@ type Wallets interface {
 }
 
 type Transactions interface {
+	FindByProviderID(context.Context, string, string) (Record, error)
+	GetForResolution(context.Context, string, string) (Record, error)
+	HasSuccessfulReversal(context.Context, string, string) (bool, error)
+	MarkPendingReference(context.Context, *wt.WagerTransaction, time.Time) error
+	SetResolvedReference(context.Context, *wt.WagerTransaction, wt.Status, string) error
 	FindFinancial(context.Context, string, string) (Record, error)
 	TryInsertExternal(context.Context, *wt.WagerTransaction, [32]byte) (bool, error)
 	CompleteOutcome(context.Context, *wt.WagerTransaction, wt.Status, money.Money) error
