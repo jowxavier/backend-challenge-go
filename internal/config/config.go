@@ -6,7 +6,8 @@ import (
 )
 
 type Config struct {
-	HTTP HTTPConfig
+	HTTP        HTTPConfig
+	DatabaseURL string
 }
 
 type HTTPConfig struct {
@@ -16,10 +17,15 @@ type HTTPConfig struct {
 
 func Load() (*Config, error) {
 	cfg := &Config{
+		DatabaseURL: getEnv("DATABASE_URL", ""),
 		HTTP: HTTPConfig{
 			Host: getEnv("HTTP_HOST", "0.0.0.0"),
 			Port: getEnv("HTTP_PORT", "8080"),
 		},
+	}
+
+	if cfg.DatabaseURL == "" {
+		return nil, fmt.Errorf("DATABASE_URL is required")
 	}
 
 	if cfg.HTTP.Port == "" {

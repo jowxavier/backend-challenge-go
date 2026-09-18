@@ -6,7 +6,7 @@ This living document records implemented architecture and agreed design decision
 
 **Decided; partially implemented.** The Go application is composed with Uber Fx. The domain must remain independent of Fx, HTTP, SQS, and persistence libraries. HTTP handlers and the SQS consumer will eventually call the same application use cases. Infrastructure adapters will implement interfaces required by the application/domain layers.
 
-Configuration, application composition, an HTTP server, the Money value object, the Wallet aggregate, and the WagerTransaction entity exist today. Other domain models, application use cases, persistence adapters, and messaging components are not implemented yet.
+Configuration, application composition, an HTTP server, the Money value object, the Wallet aggregate, and the WagerTransaction entity exist today. PostgreSQL repositories and transaction infrastructure are implemented. Other domain models, financial application use cases, and messaging components are not implemented yet.
 
 ## Application composition and lifecycle
 
@@ -23,7 +23,7 @@ The HTTP server uses `net/http` and `fx.Lifecycle`: `OnStart` launches `ListenAn
 | `HTTP_HOST` | `0.0.0.0` |
 | `HTTP_PORT` | `8080` |
 
-Defaults apply when variables are absent. An explicitly empty `HTTP_PORT` is rejected. Further configuration validation and dependency settings are not implemented.
+Defaults apply when variables are absent. An explicitly empty `HTTP_PORT` is rejected. `DATABASE_URL` is required by the Go application and passed to pgx configuration; there is no application credential default. `.env.example` includes a local Compose connection string. The shell must export this variable when running the API; the Go configuration loader does not load `.env` files.
 
 ## Money
 
@@ -47,7 +47,7 @@ Amounts must be valid, non-negative Money in the wallet currency. Insufficient f
 
 Valid zero credits/debits are no-ops: balance, version, and timestamps remain unchanged, consistent with the README's balance-change version rule. Positive changes increment the version exactly once; version overflow is rejected. The application layer supplies processing timestamps, stored in UTC. Creation and balance-changing operations require non-zero timestamps. Timestamp ordering is not a Wallet invariant; earlier timestamps are accepted. Valid zero operations require no timestamp, but still validate the Wallet, Money, and currency. `createdAt` never changes.
 
-This checkpoint enforces only in-memory balance invariants and creates no ledger entries or events. Global uniqueness of `(playerId, currency)` is enforced by the initial schema. Durable ledger consistency, PostgreSQL transaction boundaries, and cross-instance concurrency control remain **To be decided**.
+This checkpoint enforces only in-memory balance invariants and creates no ledger entries or events. Global uniqueness of `(playerId, currency)` is enforced by the initial schema. Durable ledger consistency and complete financial transaction orchestration remain **To be decided**. Repository locking is described below.
 
 ## WagerTransaction
 
@@ -61,7 +61,7 @@ Application-supplied processing timestamps must be non-zero and are normalized t
 
 FailureCode is distinct from Go validation errors. `Reject` accepts business codes `BET_INSUFFICIENT_FUNDS`, `REVERSAL_INSUFFICIENT_FUNDS`, and `REFERENCE_NOT_FOUND`; `Fail` accepts `PERMANENT_INFRASTRUCTURE_FAILURE`. This small catalog validates the business/infrastructure category, not code applicability to individual operation kinds. The application must select the appropriate outcome and classify infrastructure failures; temporary outages do not imply FAILED. Wrapped Money errors remain available through `errors.Is`.
 
-**Deferred:** OPENING, reference resolution and resolved internal reference ID, cross-transaction validation, idempotency/key storage, payload hashing, result balance/replay, repositories, ledger, and outbox. Initial persistence schema and explicit rehydration are implemented below. No financial movement or event generation occurs here. Future application code must coordinate WagerTransaction, Wallet, Ledger, and Outbox atomically.
+**Deferred:** OPENING, reference resolution and resolved internal reference ID, cross-transaction validation, idempotency/key storage, payload hashing, result balance/replay, ledger, and outbox. Initial persistence schema and explicit rehydration are implemented below. No financial movement or event generation occurs here. Future application code must coordinate WagerTransaction, Wallet, Ledger, and Outbox atomically.
 
 ## Persistence checkpoint 1
 
@@ -85,11 +85,37 @@ docker compose run --rm migrate up
 
 For an isolated up/down verification, use a separate Compose project and unused port consistently, for example `POSTGRES_PORT=55439 docker compose -p wager-persistence-check1 ...`. After applying both migrations, `run --rm migrate down 2` removes both application tables; apply `up` again to verify reversibility. `down` without `--volumes` stops that project's containers while retaining its database. Changing POSTGRES initialization settings does not rewrite an existing volume.
 
-PostgreSQL timestamp storage has microsecond precision; rehydration itself never truncates or replaces timestamps. Database adapters must handle UTC display and persistence precision explicitly. Repository implementation and per-wallet concurrency locking are the next checkpoint; no repositories, transaction runner, locking, or financial processing exist yet.
+PostgreSQL timestamp storage has microsecond precision; rehydration itself never truncates or replaces timestamps. Database adapters must handle UTC display and persistence precision explicitly. Repositories and per-wallet locking are implemented in checkpoint 2 below. Financial processing remains deferred.
+
+## Persistence checkpoint 2
+
+**Implemented.** `internal/infrastructure/postgres` uses pgx/v5 and pgxpool with explicit SQL. Its Fx module constructs the pool from `DATABASE_URL`, verifies connectivity in OnStart, and closes the pool in OnStop (also closing it if startup ping fails). The module is composed before HTTP, so HTTP stops before the pool. Connection attempts have a five-second timeout; operations also receive caller contexts.
+
+`Runner.WithinTransaction(ctx, callback)` owns a single READ COMMITTED pgx transaction. The callback receives Wallet and WagerTransaction repositories bound to that exact transaction. Success commits; callback errors roll back; commit errors are returned without retries or assumptions about replay safety. Cleanup uses a bounded context independent of request cancellation, also on panic. Rollback errors preserve the original error. Callback repositories must not escape or be used concurrently. A database rollback does not undo changes to in-memory domain objects.
+
+Wallet repository methods are Insert, GetByID, GetForUpdate, and UpdateBalance. GetForUpdate executes SELECT FOR UPDATE and refuses pool-only use. UpdateBalance changes only balance_minor, version, and updated_at, guarded by expectedVersion. WagerTransaction methods are Insert, GetByID, GetByFinancialIdentity, and UpdateOutcome; the latter changes only status, failure_code, and updated_at, guarded by expectedStatus. Zero affected rows produce the corresponding stale-write error (including a missing update target). Reads have a separate not-found error. No generic Save/Upsert/Delete operations are exposed.
+
+Constraint-specific infrastructure errors map `wallets_player_currency_unique` to duplicate wallet identity and `wager_financial_identity_unique` to duplicate financial identity. Other database violations, including primary-key collisions, retain their diagnostic cause without being misclassified. These errors are not domain business rejections.
+
+Money travels as int64/BIGINT through MinorUnits and FromMinorUnits. Loading uses Wallet.Rehydrate and WagerTransaction.Rehydrate. Invalid persisted state wraps its cause with ErrInvalidPersistedData. Stored currency must already be canonical: the adapter checks for normalization changes rather than silently repairing values. Optional SQL NULLs become absent domain fields; non-NULL empty optional fields are rejected. Timestamp instants load as UTC at PostgreSQL's microsecond precision. Domain logic remains independent of pgx.
+
+Integration tests require real PostgreSQL and `TEST_DATABASE_URL`. Each test creates an isolated randomly named schema, applies the existing migration SQL, and drops its own schema on cleanup. The supplied test account must be able to create schemas. Tests cover repositories, constraints/error mapping, rollback and commit failure, cancellation, Fx pool lifecycle, corrupted state, and actual lock contention observed through pg_blocking_pids. These are repository tests, not proof of complete financial processing correctness.
+
+```sh
+POSTGRES_PORT=55439 docker compose -p wager-persistence-check1 up -d --wait postgres
+export TEST_DATABASE_URL='postgres://wager:local_only@localhost:55439/wager?sslmode=disable'
+go test -tags=integration -count=1 ./internal/infrastructure/postgres
+go test -race -tags=integration -count=1 ./internal/infrastructure/postgres
+# Go application configuration (use the actual local port):
+export DATABASE_URL="$TEST_DATABASE_URL"
+go run ./cmd/api
+```
+
+Ledger/outbox/inbox, financial orchestration, idempotency, reference processing, and multi-process financial scenarios remain deferred. No transaction retry or worker machinery is introduced.
 
 ## Concurrency direction
 
-**Decided; not implemented.** Correctness must not rely on process-local locks or global locks. Coordination must work across multiple application instances, and independent wallets must be able to progress in parallel. The exact PostgreSQL locking strategy is not finalized.
+**Implemented at repository level.** Wallet `GetForUpdate` uses PostgreSQL row locking within an existing READ COMMITTED transaction. No process-local or global locks provide correctness. Tests prove lock contention across independent connections; complete multi-instance financial correctness remains unimplemented.
 
 ## Future decisions
 
@@ -97,11 +123,11 @@ The following mechanisms are required by the challenge, but their designs have n
 
 ### PostgreSQL transaction boundaries — To be decided
 
-Database access library, transaction ownership across repositories, isolation levels, and atomic grouping of wallet state, transactions, ledger, inbox, and outbox writes.
+pgx, application-owned transaction callbacks, and READ COMMITTED are implemented. Atomic grouping of wallet state, transactions, ledger, inbox, and outbox in financial application processing remains deferred.
 
 ### Wallet concurrency control — To be decided
 
-PostgreSQL locking or conditional update strategy, wallet version handling, lock ordering, and conflict retry limits.
+Per-wallet SELECT FOR UPDATE and expected-version guards are implemented. Lock ordering across multiple entities and application conflict recovery remain deferred.
 
 ### Persistent idempotency — To be decided
 
