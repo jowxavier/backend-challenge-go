@@ -36,28 +36,49 @@ func newID() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
-func (p *Processor) Process(ctx context.Context, r ProcessRequest) (ProcessResult, error) {
+func (p *Processor) prepare(r ProcessRequest) (*wt.WagerTransaction, [32]byte, error) {
 	if r.Kind != wt.BET && r.Kind != wt.WIN && r.Kind != wt.LOSS && r.Kind != wt.REFUND && r.Kind != wt.ROLLBACK {
-		return ProcessResult{}, ErrUnsupportedOperation
+		return nil, [32]byte{}, ErrUnsupportedOperation
 	}
 	if r.IdempotencyKey == "" || !utf8.ValidString(r.IdempotencyKey) || strings.IndexFunc(r.IdempotencyKey, func(c rune) bool { return unicode.IsSpace(c) || unicode.IsControl(c) }) >= 0 {
-		return ProcessResult{}, ErrInvalidInput
+		return nil, [32]byte{}, ErrInvalidInput
 	}
 	id, err := newID()
 	if err != nil {
-		return ProcessResult{}, err
+		return nil, [32]byte{}, err
 	}
 	at := p.processingTime()
 	tx, err := wt.NewExternal(wt.ExternalInput{ID: id, ProviderID: r.ProviderID, ExternalTransactionID: r.ExternalTransactionID, PlayerID: r.PlayerID, WalletID: r.WalletID, RoundID: r.RoundID, GameID: r.GameID, Kind: r.Kind, Money: r.Money, ReferenceExternalTransactionID: r.ReferenceExternalTransactionID}, at)
 	if err != nil {
-		return ProcessResult{}, fmt.Errorf("%w: %w", ErrInvalidInput, err)
+		return nil, [32]byte{}, fmt.Errorf("%w: %w", ErrInvalidInput, err)
 	}
 	hash, err := Fingerprint(r)
+	if err != nil {
+		return nil, [32]byte{}, err
+	}
+	return tx, hash, nil
+}
+
+func (p *Processor) Process(ctx context.Context, r ProcessRequest) (ProcessResult, error) {
+	tx, hash, err := p.prepare(r)
 	if err != nil {
 		return ProcessResult{}, err
 	}
 	var result ProcessResult
 	err = p.transactions.WithinFinancialTransaction(ctx, func(repos Repositories) error {
+		result, err = p.process(ctx, repos, r, tx, hash)
+		return err
+	})
+	if err != nil {
+		return ProcessResult{}, err
+	}
+	return result, nil
+}
+
+// process uses only repositories bound to the caller's transaction.
+func (p *Processor) process(ctx context.Context, repos Repositories, r ProcessRequest, tx *wt.WagerTransaction, hash [32]byte) (ProcessResult, error) {
+	var result ProcessResult
+	err := func() error {
 		replay := func(record Record) error {
 			if record.Transaction == nil {
 				return ErrInvalidPersistedData
@@ -118,10 +139,6 @@ func (p *Processor) Process(ctx context.Context, r ProcessRequest) (ProcessResul
 			return err
 		}
 		return nil
-	})
-	// A callback result is provisional until COMMIT is confirmed.
-	if err != nil {
-		return ProcessResult{}, err
-	}
-	return result, nil
+	}()
+	return result, err
 }

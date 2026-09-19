@@ -7,6 +7,7 @@ import (
 )
 
 type Config struct {
+	Messaging           MessagingConfig
 	HTTP                HTTPConfig
 	DatabaseURL         string
 	ReferencePendingTTL time.Duration
@@ -39,6 +40,10 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("REFERENCE_PENDING_TTL must be a positive duration")
 	}
 	cfg.ReferencePendingTTL = ttl
+	cfg.Messaging, err = loadMessaging()
+	if err != nil {
+		return nil, err
+	}
 	return cfg, nil
 }
 

@@ -14,6 +14,25 @@ services:
       interval: 2s
       timeout: 5s
       retries: 30
+  localstack:
+    image: localstack/localstack:4.0.3
+    ports:
+      - "127.0.0.1:${LOCALSTACK_PORT:-4566}:4566"
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      SQS_ENDPOINT_STRATEGY: dynamic
+      SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT:-5}
+      SQS_VISIBILITY_SECONDS: ${SQS_VISIBILITY_SECONDS:-60}
+    volumes:
+      - ./scripts/localstack/init.sh:/etc/localstack/init/ready.d/init-sqs.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS localhost:4566/_localstack/init/ready | python3 -c 'import json,sys; x=json.load(sys.stdin); sys.exit(not x.get(\"completed\") or any(s.get(\"state\") != \"SUCCESSFUL\" for s in x.get(\"scripts\", [])))' && awslocal sqs get-queue-url --queue-name wager-events >/dev/null && awslocal sqs get-queue-url --queue-name wager-transactions.fifo >/dev/null"]
+      interval: 3s
+      timeout: 10s
+      retries: 40
   migrate:
     image: migrate/migrate:v4.18.3
     profiles: ["tools"]

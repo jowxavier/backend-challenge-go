@@ -75,6 +75,7 @@ type OutboxWriter interface {
 }
 
 type Repositories struct {
+	Inbox        Inbox
 	Outbox       OutboxWriter
 	Wallets      Wallets
 	Transactions Transactions

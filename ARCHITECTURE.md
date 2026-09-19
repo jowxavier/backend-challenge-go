@@ -4,9 +4,9 @@ This living document records implemented architecture and agreed design decision
 
 ## Architecture direction
 
-**Decided; partially implemented.** The Go application is composed with Uber Fx. The domain must remain independent of Fx, HTTP, SQS, and persistence libraries. HTTP handlers and the SQS consumer will eventually call the same application use cases. Infrastructure adapters will implement interfaces required by the application/domain layers.
+**Decided; partially implemented.** The Go application is composed with Uber Fx. The domain must remain independent of Fx, HTTP, SQS, and persistence libraries. The SQS consumer uses the shared financial execution; future HTTP financial handlers will use the same processor. Infrastructure adapters will implement interfaces required by the application/domain layers.
 
-Configuration, application composition, an HTTP server, the Money value object, the Wallet aggregate, and the WagerTransaction entity exist today. PostgreSQL repositories and transaction infrastructure are implemented. The financial application processor and append-only ledger implement BET, WIN, LOSS, REFUND and ROLLBACK, including explicit pending-reference resolution. Transactional outbox snapshots and a transport-independent delivery service are implemented in checkpoint 5; no messaging transport or production publisher worker is started.
+Configuration, application composition, an HTTP server, the Money value object, the Wallet aggregate, and the WagerTransaction entity exist today. PostgreSQL repositories and transaction infrastructure are implemented. The financial application processor and append-only ledger implement BET, WIN, LOSS, REFUND and ROLLBACK, including explicit pending-reference resolution. Transactional outbox snapshots and a transport-independent delivery service are implemented in checkpoint 5; checkpoint 6 adds the SQS transport, persistent Inbox and production consumer/publisher lifecycle.
 
 ## Application composition and lifecycle
 
@@ -111,7 +111,7 @@ export DATABASE_URL="$TEST_DATABASE_URL"
 go run ./cmd/api
 ```
 
-Checkpoint 3 implements ledger, financial orchestration, and idempotency below. Inbox and multi-process financial scenarios remain deferred; outbox is implemented in checkpoint 5 below. Reference processing is implemented in checkpoint 4 below. No transaction retry or worker machinery is introduced.
+Checkpoint 3 implements ledger, financial orchestration, and idempotency below. Multi-process financial scenarios remain deferred; outbox and Inbox are implemented in checkpoints 5 and 6 below. Reference processing is implemented in checkpoint 4 below. No transaction retry or worker machinery is introduced.
 
 ## Persistence/application checkpoint 3
 
@@ -153,7 +153,7 @@ Migration 000003 adds fingerprint/results, supporting composite keys, key bindin
 
 Integration fixtures apply all three migrations to isolated schemas. Tests cover financial outcomes and replay, key conflicts/aliases, schema constraints and append-only protection, real transaction rollback at multiple write stages, database-raised failure, independent-wallet progress, two concurrent BET 80.00 against 100.00, 50 distinct operations, 50 duplicate copies, and concurrent aliases. Synchronization uses channels and PostgreSQL lock observation rather than sleeps. UP/DOWN/UP and refusal of a populated legacy dataset are tested. Positive initial balances are fixtures; ledger assertions cover checkpoint deltas, not complete from-zero reconciliation without OPENING.
 
-Run all integration tests with the TEST_DATABASE_URL setup above, both normally and with -race. Three independent process verification is required later; concurrent connections/goroutines are not claimed as its substitute. Checkpoint 4 extends this processor with reference operations below. OPENING, inbox/SQS, HTTP financial endpoints, OAuth/OIDC, and recovery workers remain deferred. Checkpoint 5 adds outbox persistence and explicit delivery invocations. This checkpoint does not claim full challenge compliance or event-delivery guarantees.
+Run all integration tests with the TEST_DATABASE_URL setup above, both normally and with -race. Three independent process verification is required later; concurrent connections/goroutines are not claimed as its substitute. Checkpoint 4 extends this processor with reference operations below. OPENING, HTTP financial endpoints, OAuth/OIDC, and pending-reference recovery workers remain deferred; Inbox/SQS are implemented in checkpoint 6. Checkpoint 5 adds outbox persistence and explicit delivery invocations. This checkpoint does not claim full challenge compliance or event-delivery guarantees.
 
 ## Persistence/application checkpoint 4
 
@@ -194,7 +194,7 @@ Migration 000004 adds reference_transaction_id, reference_deadline_at, provider/
 
 Tests cover reference directions, contextual validation, provider isolation, pending/terminal references, aliases, strict expiration with an injected clock, historical replay, rollback of resolver failures, and the independent database uniqueness constraint. Channel barriers and observed PostgreSQL lock dependencies exercise competing reversals, two resolvers, replay versus resolver, and original versus reversal in both lock orders. Goroutines are cancelled and joined before cleanup; no sleeps establish correctness. Checkpoint 3 regression scenarios remain in the integration suite.
 
-HTTP, SQS/inbox, OAuth/OIDC, Keycloak, OPENING, background resolution/backoff, production workers and three-process verification remain deferred. Outbox delivery is described in checkpoint 5 below. This is not complete challenge compliance.
+HTTP financial endpoints, OAuth/OIDC, Keycloak, OPENING, background reference resolution/backoff and three-process verification remain deferred. Checkpoint 6 implements Inbox/SQS and messaging workers. Outbox delivery is described in checkpoint 5 below. This is not complete challenge compliance.
 
 ## Persistence/application checkpoint 5 — Transactional outbox
 
@@ -228,19 +228,72 @@ The partial pending index is (next_attempt_at,id) WHERE published_at IS NULL. No
 
 ### Delivery and recovery
 
-`internal/application/outbox.Service.RunOnce` claims at most one event and publishes through EventPublisher, then marks success or reschedules failure. It is explicitly invoked and does not start a production background worker or fake transport. Options are constructor-injected, with DefaultConfig: publish timeout 10s, lease 30s, initial backoff 1s, maximum 5m. Invalid/non-positive values or a lease not longer than publish timeout are rejected. Clock is injected; no environment reads or financial time.Now calls are introduced.
+`internal/application/outbox.Service.RunOnce` claims at most one event and publishes through EventPublisher, then marks success or reschedules failure. The service itself does not start a worker; checkpoint 6 invokes it from a separate production worker using the SQS adapter. Options are constructor-injected, with DefaultConfig: publish timeout 10s, lease 30s, initial backoff 1s, maximum 5m. Invalid/non-positive values or a lease not longer than publish timeout are rejected. Clock is injected; no environment reads or financial time.Now calls are introduced.
 
 PostgreSQL ClaimBatch uses a short READ COMMITTED transaction and SELECT FOR UPDATE SKIP LOCKED. Eligibility requires unpublished, due next_attempt_at, and an absent/expired lease. Claiming sets a fresh random token, lease deadline and increments attempt_count. The claim transaction commits before any network call. Records may proceed independently across instances. One event per service invocation avoids a locally queued batch consuming leases before publication.
 
 MarkPublished and Reschedule are guarded by event ID, current lease token and unpublished state. A replaced token cannot update metadata. Reschedule clears the lease and sets the next attempt; only fixed safe diagnostic categories (publish_failed, publish_timeout, publish_cancelled) are stored, never raw transport errors. Retry delay doubles with a cap and never discards an event after an attempt limit. An unsuccessful metadata write or interrupted process leaves a lease that another invocation can reclaim after expiry. No lease-renewal loop or scheduler is needed for this bounded invocation.
 
-Delivery is **at-least-once**, not exactly-once. Publication accepted followed by a crash/unknown acknowledgement before MarkPublished can cause republication with the same persisted eventId. This ID supports downstream durable deduplication. A stale publisher can still complete external I/O after lease expiry; fencing protects database updates, not the external broker, so duplicates remain part of the contract. Eventual delivery assumes future invocations and recovery of dependencies. Production workers and broker integration remain deferred.
+Delivery is **at-least-once**, not exactly-once. Publication accepted followed by a crash/unknown acknowledgement before MarkPublished can cause republication with the same persisted eventId. This ID supports downstream durable deduplication. A stale publisher can still complete external I/O after lease expiry; fencing protects database updates, not the external broker, so duplicates remain part of the contract. Eventual delivery assumes future invocations and recovery of dependencies. Checkpoint 6 adds production workers and broker integration below.
 
 No ordering is promised. PendingReference may arrive after a terminal event; consumers must not regress terminal status. WalletBalanceChanged carries walletVersion for ordering balance snapshots. Envelope version is a schema version, not a financial sequence. No global mutex or serialization is used.
 
 ### Verification
 
 Unit tests cover concrete snapshots, null fields, exact Money formatting, invalid events, retry limits, configuration, clock and safe diagnostics. Real PostgreSQL tests cover the emission matrix, pending resolution/replay, atomic rollback before/during/after event insertion, uncommitted invisibility, logical uniqueness, immutable columns, DELETE/TRUNCATE rejection, claim concurrency, SKIP LOCKED progress, lease recovery/fencing, publish/retry/restart and duplicate delivery with stable IDs. Migration UP/DOWN/UP and populated-DOWN refusal use isolated schemas. Existing financial regression tests remain intact in meaning. Concurrency uses explicit synchronization and injected times, not arbitrary sleeps.
+
+## Messaging checkpoint 6 — SQS and persistent Inbox
+
+**Implemented.** Two separate flows exist: inbound commands on `wager-transactions.fifo` call `Processor.ProcessMessage`; outbound immutable outbox envelopes are published to the Standard queue `wager-events`. The outbound queue is never consumed as financial commands. AWS SDK for Go v2 stays in infrastructure/adapters. Fx registers production workers through `internal/interfaces/messaging`; the financial domain has no SDK or Fx dependency.
+
+### Inbound contract and trust
+
+The JSON envelope requires messageId, type=WagerTransactionRequested, occurredAt and typed data matching the README. Money is parsed from strings through the existing Money parser. referenceExternalTransactionId may be absent/null. Unknown envelope fields/types, invalid JSON, invalid envelope identity/timestamp and invalid Money are rejected. occurredAt is metadata; processing still uses the injected application clock. The exact received body bytes are preserved for SHA-256.
+
+The queue is a **trusted internal transport boundary**. Only trusted/internal producers may submit commands; providerId comes from their envelope and is not authenticated merely by SQS receipt. External-provider authentication and IAM deployment policies are not implemented. Local fake credentials/emulation do not prove production access control. Existing financial/reference provider scoping is unchanged.
+
+### Inbox transaction
+
+Migration 000006 creates inbox_messages with PK(consumer_name,message_id), original-body SHA-256 BYTEA(32), received_at, completed_at and transaction_id FK without cascade. Completion timestamp and transaction ID must be absent/present together. Identity/hash/received_at and completed outcomes are immutable; DELETE/TRUNCATE are rejected. DOWN refuses a non-empty Inbox. There are no leases, retry counters or state strings. SQS owns inbound retry scheduling.
+
+The stable consumer name defaults to wager-financial-v1 and must remain the same across replicas/restarts. Inbox identity uses the envelope messageId, never the SQS-generated ID or receipt handle. Changing even whitespace under the same identity conflicts because this hash covers original bytes. It is separate from the existing canonical financial fingerprint.
+
+Process keeps its prior public behavior. A private shared execution method takes transaction-bound repositories; ProcessMessage starts one READ COMMITTED transaction, inserts Inbox with targeted ON CONFLICT DO NOTHING, runs that same financial execution, then completes Inbox before commit. Wallet, wager outcome, ledger, bindings and outbox use that exact pgx transaction. No nested transaction or generic UnitOfWork is introduced. The added lock order is Inbox identity before the existing wallet-first financial sequence; the regular Process path never acquires Inbox locks.
+
+On conflict, a fresh SELECT sees the winner's committed record. Same hash/completed record returns a durable duplicate without financial execution. Different hash is ErrInboxConflict. A confirmed incomplete record is ErrInvalidPersistedData, never successful acknowledgement. New-message financial replay still completes its own Inbox row. In-progress Inbox rows are uncommitted; rollback leaves no accepted incomplete row. Commit errors return no provisional success. received_at represents the successful processing attempt, not a history of failed SQS deliveries.
+
+### Consumer, retry and deletion
+
+Each configurable worker receives at most one message and calls the application coordinator. DeleteMessage follows confirmed processing only: PROCESSED, REJECTED, PENDING_REFERENCE, financial replay and completed Inbox duplicate. Pending-reference completion does not resolve the dependency or extend its deadline. The automatic reference resolver remains deferred.
+
+Malformed/unsupported commands, invalid input, identity/hash conflicts and infrastructure/timeout/ambiguous-commit failures are not deleted as success. No artificial financial rejection or Inbox identity is fabricated for malformed input. ChangeMessageVisibility uses ApproximateReceiveCount with 1s, 2s, 4s... capped at 60s. Visibility-change failure leaves recovery to the existing timeout. Poison messages reach the FIFO DLQ through native redrive; the application never manually sends to DLQ and deletes. A delete failure allows safe redelivery. No in-memory deduplication exists.
+
+Defaults: visibility 60s, processing timeout 20s, long polling 20s, consumer concurrency 4 and maxReceiveCount 5. Processing timeout must be shorter than visibility. Producer guidance/test helpers use hex SHA-256(walletId) for MessageGroupId and hex SHA-256(envelope messageId) for MessageDeduplicationId. Tests intentionally use distinct transport dedup IDs when demonstrating delivery of duplicate envelopes. FIFO deduplication is not a financial correctness mechanism.
+
+### Outbound and lifecycle
+
+The SQS EventPublisher sends Event.JSON() unchanged to wager-events. It performs no SQL or event reconstruction. SendMessage success means transport acceptance; errors, including ambiguous sends, are handled by existing outbox retry/leases. At-least-once and stable eventId remain the contract, with no ordering promise.
+
+Startup resolves queue URLs, verifies inbound FIFO/redrive and Standard output, then starts independent consumer slots and an outbox worker. The outbox worker invokes RunOnce and waits briefly on empty/error results; no complex scheduler is added. OnStop cancels new receives/claims, lets active work finish within the shutdown context, then cancels outstanding work. A bounded additional cleanup window allows database rollback and visibility cleanup to finish before dependencies close. The consumer does not delete if processing context is cancelled; unacknowledged work becomes visible again. The WaitGroup joins workers for lifecycle management only, never financial correctness. PostgreSQL hooks are registered before messaging so shutdown closes PostgreSQL afterward.
+
+### Local setup and configuration
+
+Compose pins LocalStack 4.0.3, SQS-only, exposed on localhost:4566 by default. The executable ready.d script is idempotent and provisions wager-transactions-dlq.fifo, wager-transactions.fifo with native redrive, and wager-events Standard. Health checks inspect initialization success and queue availability, not just TCP. Local fake AWS credentials are test/test; no real secrets are supplied. The emulator setup is for development, not a claim of production broker persistence/security.
+
+Application settings: SQS_ENDPOINT (default http://localhost:4566; empty uses AWS endpoints), AWS_REGION (us-east-1), AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY via the SDK credential chain, SQS_INPUT_QUEUE, SQS_OUTPUT_QUEUE, SQS_CONSUMER_NAME, SQS_CONCURRENCY, SQS_VISIBILITY_TIMEOUT, SQS_PROCESSING_TIMEOUT and SQS_LONG_POLL. Compose provisioning uses SQS_MAX_RECEIVE_COUNT=5 and SQS_VISIBILITY_SECONDS=60. ReceiveMessage explicitly sets the application's visibility timeout. LOCALSTACK_PORT controls the host port; SQS_ENDPOINT must match it when changed. Export environment variables when running Go; the Go loader does not source .env.
+
+```sh
+docker compose up -d --wait postgres localstack
+docker compose run --rm migrate up
+# Requires exported DATABASE_URL, AWS_REGION and fake local AWS credentials.
+go run ./cmd/api
+# Existing PostgreSQL suite:
+go test -tags=integration -count=1 ./...
+# Full PostgreSQL + LocalStack suite (also run with -race):
+TEST_SQS_ENDPOINT=http://localhost:4566 go test -tags=integration,sqsintegration -count=1 ./...
+```
+
+All integration commands require TEST_DATABASE_URL. Tests isolate PostgreSQL schemas and SQS queue names. Tests cover atomic completion/rollback, duplicates/restart/hash conflict, financial replay, ambiguous commit, concurrent same/independent Inbox identities, rejection/pending completion, migration UP/DOWN/UP, real SQS re-delivery/delete, native poison redrive, transient visibility retry, exact outbound snapshots, ambiguous sends and multiple consumers. A real Fx lifecycle test exercises queued work, consumer processing, outbox publication and shutdown. Concurrency assertions use barriers; broker waits use bounded receives rather than arbitrary sleeps. HTTP financial endpoints, OAuth/OIDC, Keycloak, OPENING and automatic reference resolution remain deferred.
 
 ## Concurrency direction
 
@@ -252,7 +305,7 @@ The following mechanisms remain incomplete; implemented checkpoint decisions abo
 
 ### PostgreSQL transaction boundaries — To be decided
 
-pgx, application-owned transaction callbacks, and READ COMMITTED are implemented. Wallet, transaction, ledger, key bindings, and saved results are now grouped atomically. Outbox now shares that transaction; inbox integration remains deferred.
+pgx, application-owned transaction callbacks, and READ COMMITTED are implemented. Wallet, transaction, ledger, key bindings, and saved results are now grouped atomically. Outbox and Inbox now share that transaction.
 
 ### Wallet concurrency control — To be decided
 
@@ -266,13 +319,13 @@ Implemented for the shared financial processor above; transport integration and 
 
 Schema, immutable entries, and database protections are implemented above. Opening entries and consistent reconciliation reads remain deferred.
 
-### Inbox processing — To be decided
+### Inbox processing — Implemented
 
-Message identity/hash storage, duplicate handling, transaction integration, and durable completion before SQS acknowledgment.
+Checkpoint 6 implements durable identity/hash, guarded completion and atomic financial integration.
 
 ### Transactional outbox — Implemented core; transport deferred
 
-Checkpoint 5 defines snapshots, concurrent claims, retries and recovery. Output destination, SQS adapter and production worker lifecycle remain undecided.
+Checkpoint 5 defines snapshots, concurrent claims, retries and recovery. Checkpoint 6 implements the SQS destination/adapter and production worker lifecycle.
 
 ### Reference and reversal processing — To be decided
 
@@ -282,9 +335,9 @@ Reference resolution, strict expiration, and reversal exclusivity are implemente
 
 External identity provider, credential validation, provider identity mapping, permissions for internal wallet operations, and broker access policies. Authentication is not implemented.
 
-### SQS retry and DLQ policy — To be decided
+### SQS retry and DLQ policy — Implemented
 
-FIFO grouping/deduplication identifiers, visibility timeout, retry/backoff limits, redrive configuration, invalid-message handling, and shutdown behavior.
+Checkpoint 6 defines FIFO grouping guidance, visibility/processing timeouts, backoff, native redrive, poison-message handling and shutdown.
 
 ### Observability — To be decided
 
