@@ -3,6 +3,7 @@ package http
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"time"
 
@@ -14,27 +15,27 @@ type Server struct {
 	server *http.Server
 }
 
-func NewServer(lc fx.Lifecycle, cfg *config.Config) *Server {
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("GET /health/live", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
-	})
+func NewServer(lc fx.Lifecycle, cfg *config.Config, api *API) *Server {
 
 	srv := &Server{
 		server: &http.Server{
 			Addr:              fmt.Sprintf("%s:%s", cfg.HTTP.Host, cfg.HTTP.Port),
-			Handler:           mux,
+			Handler:           api.Handler(),
+			ReadTimeout:       15 * time.Second,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       60 * time.Second,
 			ReadHeaderTimeout: 5 * time.Second,
 		},
 	}
 
 	lc.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {
+			listener, err := net.Listen("tcp", srv.server.Addr)
+			if err != nil {
+				return err
+			}
 			go func() {
-				if err := srv.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				if err := srv.server.Serve(listener); err != nil && err != http.ErrServerClosed {
 					fmt.Printf("http server error: %v\n", err)
 				}
 			}()

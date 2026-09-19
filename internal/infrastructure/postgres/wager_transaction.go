@@ -72,11 +72,24 @@ func (r *WagerTransactionRepository) UpdateOutcome(ctx context.Context, t *wt.Wa
 }
 func scanWager(row pgx.Row) (*wt.WagerTransaction, error) {
 	var s wt.State
+	var provider, external, round, game *string
 	var n int64
 	var c string
 	var ref, code *string
-	if err := row.Scan(&s.ID, &s.ProviderID, &s.ExternalTransactionID, &s.PlayerID, &s.WalletID, &s.RoundID, &s.GameID, &s.Kind, &n, &c, &ref, &s.Status, &code, &s.CreatedAt, &s.UpdatedAt); err != nil {
+	if err := row.Scan(&s.ID, &provider, &external, &s.PlayerID, &s.WalletID, &round, &game, &s.Kind, &n, &c, &ref, &s.Status, &code, &s.CreatedAt, &s.UpdatedAt); err != nil {
 		return nil, scanError(err)
+	}
+	if provider != nil {
+		s.ProviderID = *provider
+	}
+	if external != nil {
+		s.ExternalTransactionID = *external
+	}
+	if round != nil {
+		s.RoundID = *round
+	}
+	if game != nil {
+		s.GameID = *game
 	}
 	if ref != nil {
 		if *ref == "" {

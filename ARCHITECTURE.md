@@ -4,7 +4,7 @@ This living document records implemented architecture and agreed design decision
 
 ## Architecture direction
 
-**Decided; partially implemented.** The Go application is composed with Uber Fx. The domain must remain independent of Fx, HTTP, SQS, and persistence libraries. The SQS consumer uses the shared financial execution; future HTTP financial handlers will use the same processor. Infrastructure adapters will implement interfaces required by the application/domain layers.
+**Decided; partially implemented.** The Go application is composed with Uber Fx. The domain must remain independent of Fx, HTTP, SQS, and persistence libraries. The SQS consumer uses the shared financial execution; HTTP financial handlers use the same processor. Infrastructure adapters will implement interfaces required by the application/domain layers.
 
 Configuration, application composition, an HTTP server, the Money value object, the Wallet aggregate, and the WagerTransaction entity exist today. PostgreSQL repositories and transaction infrastructure are implemented. The financial application processor and append-only ledger implement BET, WIN, LOSS, REFUND and ROLLBACK, including explicit pending-reference resolution. Transactional outbox snapshots and a transport-independent delivery service are implemented in checkpoint 5; checkpoint 6 adds the SQS transport, persistent Inbox and production consumer/publisher lifecycle.
 
@@ -35,7 +35,7 @@ Currency codes are normalized to uppercase. Validation currently checks ISO 4217
 
 `Money{}` is intentionally invalid; use `Zero(currency)` for monetary zero. Public operations and accessors reject uninitialized values with `ErrInvalidMoney`. Parsing, addition, subtraction, and negation explicitly detect overflow and return `ErrOverflow` instead of wrapping; negating the minimum `int64` value is rejected.
 
-PostgreSQL amounts use BIGINT minor units. `FromMinorUnits(int64, currency)` accepts the full signed range without conversion, validates/normalizes currency, and preserves internal negative values. `MinorUnits() (int64, error)` rejects uninitialized Money. JSON mapping remains **To be decided**.
+PostgreSQL amounts use BIGINT minor units. `FromMinorUnits(int64, currency)` accepts the full signed range without conversion, validates/normalizes currency, and preserves internal negative values. `MinorUnits() (int64, error)` rejects uninitialized Money. HTTP and event DTOs serialize Money as amount/currency string objects without floats.
 
 ## Wallet
 
@@ -53,7 +53,7 @@ This checkpoint enforces only in-memory balance invariants and creates no ledger
 
 **Implemented.** `internal/domain/wagertransaction` models external BET, WIN, LOSS, REFUND, and ROLLBACK operations as a mutable entity with private state. It owns internal/provider/external identity, player/wallet/round/game context, kind, immutable Money, optional external reference, status, failure code, and creation/update timestamps. IDs follow Wallet's opaque non-empty UTF-8 policy without whitespace or control characters. `(providerId, externalTransactionId)` identifies the financial operation conceptually; uniqueness is not enforced by this in-memory entity.
 
-`NewExternal` starts in PENDING. BET/WIN/REFUND/ROLLBACK require positive Money; LOSS requires zero. REFUND/ROLLBACK require an external reference, WIN permits one, and BET/LOSS reject references. Malformed references and self-reference by external ID are rejected. OPENING and unknown kinds are rejected.
+`NewExternal` starts in PENDING. BET/WIN/REFUND/ROLLBACK require positive Money; LOSS requires zero. REFUND/ROLLBACK require an external reference, WIN permits one, and BET/LOSS reject references. Malformed references and self-reference by external ID are rejected. External OPENING and unknown kinds are rejected. NewOpening constructs a processed internal operation with no provider/external/round/game metadata.
 
 Pointer methods `WaitForReference`, `MarkProcessed`, `Reject`, and `Fail` validate completely before changing status, failure code, or updatedAt. Failed attempts preserve the entire entity. PENDING can transition to PENDING_REFERENCE, PROCESSED, REJECTED, or FAILED. PENDING_REFERENCE can transition directly to PROCESSED, REJECTED, or FAILED. Waiting requires a declared reference. Terminal states and same-state transitions are rejected; there is no transition back to PENDING or public status setter. Nil/uninitialized entities reject transitions. Getters return values.
 
@@ -61,7 +61,7 @@ Application-supplied processing timestamps must be non-zero and are normalized t
 
 FailureCode is distinct from Go validation errors. `Reject` accepts business codes `BET_INSUFFICIENT_FUNDS`, `REVERSAL_INSUFFICIENT_FUNDS`, `REFERENCE_NOT_FOUND`, `CURRENCY_MISMATCH`, and `MONETARY_OVERFLOW`, `REFERENCE_NOT_ALLOWED`, `REFERENCE_MISMATCH`, `REFERENCE_UNSUCCESSFUL`, and `ALREADY_REVERSED`; `Fail` accepts `PERMANENT_INFRASTRUCTURE_FAILURE`. This small catalog validates the business/infrastructure category, not code applicability to individual operation kinds. The application must select the appropriate outcome and classify infrastructure failures; temporary outages do not imply FAILED. Wrapped Money errors remain available through `errors.Is`.
 
-**Deferred:** OPENING. Transactional outbox is implemented in checkpoint 5 below. Reference resolution, internal reference IDs, and cross-transaction validation are implemented in checkpoint 4 below. Application-owned persistence records now store fingerprints and replay balances, with keys in a separate binding table; these are not additional WagerTransaction domain fields. Initial persistence schema and explicit rehydration are implemented below. No financial movement or event generation occurs here. The application coordinates WagerTransaction, Wallet, Ledger, and Outbox atomically; event creation does not belong to the domain entity.
+**Implemented:** internal OPENING is added in checkpoint 7; external constructors continue rejecting it. Transactional outbox is implemented in checkpoint 5 below. Reference resolution, internal reference IDs, and cross-transaction validation are implemented in checkpoint 4 below. Application-owned persistence records now store fingerprints and replay balances, with keys in a separate binding table; these are not additional WagerTransaction domain fields. Initial persistence schema and explicit rehydration are implemented below. No financial movement or event generation occurs here. The application coordinates WagerTransaction, Wallet, Ledger, and Outbox atomically; event creation does not belong to the domain entity.
 
 ## Persistence checkpoint 1
 
@@ -115,7 +115,7 @@ Checkpoint 3 implements ledger, financial orchestration, and idempotency below. 
 
 ## Persistence/application checkpoint 3
 
-**Implemented for BET, WIN without reference, and LOSS.** `internal/application/financial.Processor.Process(ctx, ProcessRequest)` is the shared transport-independent use case. Requests carry trusted provider identity, received idempotency key, external identity, player/wallet/round/game context, kind, immutable Money, and optional reference. Results contain transaction ID, status, optional failure code, optional saved balance, and replay indicator. The provider field is a trusted input contract, not implemented authentication. No HTTP/SQS adapter or new Fx wiring is added.
+**Implemented for BET, WIN without reference, and LOSS.** `internal/application/financial.Processor.Process(ctx, ProcessRequest)` is the shared transport-independent use case. Requests carry trusted provider identity, received idempotency key, external identity, player/wallet/round/game context, kind, immutable Money, and optional reference. Results contain transaction ID, status, optional failure code, optional saved balance, and replay indicator. The provider field is a trusted input contract; checkpoint 7 binds HTTP requests to verified token client mappings. No HTTP/SQS adapter or new Fx wiring is added.
 
 The application owns narrow transaction/repository interfaces. `Runner.WithinFinancialTransaction` adapts the existing READ COMMITTED runner, binding every repository to its same pgx transaction. Domain code contains no pgx/Fx dependencies. Internal IDs use 128 random bits encoded as hex. Processing timestamps are application-generated UTC at PostgreSQL microsecond precision; no timestamp ordering invariant is added.
 
@@ -194,7 +194,7 @@ Migration 000004 adds reference_transaction_id, reference_deadline_at, provider/
 
 Tests cover reference directions, contextual validation, provider isolation, pending/terminal references, aliases, strict expiration with an injected clock, historical replay, rollback of resolver failures, and the independent database uniqueness constraint. Channel barriers and observed PostgreSQL lock dependencies exercise competing reversals, two resolvers, replay versus resolver, and original versus reversal in both lock orders. Goroutines are cancelled and joined before cleanup; no sleeps establish correctness. Checkpoint 3 regression scenarios remain in the integration suite.
 
-HTTP financial endpoints, OAuth/OIDC, Keycloak, OPENING, background reference resolution/backoff and three-process verification remain deferred. Checkpoint 6 implements Inbox/SQS and messaging workers. Outbox delivery is described in checkpoint 5 below. This is not complete challenge compliance.
+Background reference resolution/backoff and three-process verification remain deferred; checkpoint 7 adds HTTP, OAuth/OIDC, Keycloak and internal OPENING. Checkpoint 6 implements Inbox/SQS and messaging workers. Outbox delivery is described in checkpoint 5 below. This is not complete challenge compliance.
 
 ## Persistence/application checkpoint 5 — Transactional outbox
 
@@ -293,7 +293,41 @@ go test -tags=integration -count=1 ./...
 TEST_SQS_ENDPOINT=http://localhost:4566 go test -tags=integration,sqsintegration -count=1 ./...
 ```
 
-All integration commands require TEST_DATABASE_URL. Tests isolate PostgreSQL schemas and SQS queue names. Tests cover atomic completion/rollback, duplicates/restart/hash conflict, financial replay, ambiguous commit, concurrent same/independent Inbox identities, rejection/pending completion, migration UP/DOWN/UP, real SQS re-delivery/delete, native poison redrive, transient visibility retry, exact outbound snapshots, ambiguous sends and multiple consumers. A real Fx lifecycle test exercises queued work, consumer processing, outbox publication and shutdown. Concurrency assertions use barriers; broker waits use bounded receives rather than arbitrary sleeps. HTTP financial endpoints, OAuth/OIDC, Keycloak, OPENING and automatic reference resolution remain deferred.
+All integration commands require TEST_DATABASE_URL. Tests isolate PostgreSQL schemas and SQS queue names. Tests cover atomic completion/rollback, duplicates/restart/hash conflict, financial replay, ambiguous commit, concurrent same/independent Inbox identities, rejection/pending completion, migration UP/DOWN/UP, real SQS re-delivery/delete, native poison redrive, transient visibility retry, exact outbound snapshots, ambiguous sends and multiple consumers. A real Fx lifecycle test exercises queued work, consumer processing, outbox publication and shutdown. Concurrency assertions use barriers; broker waits use bounded receives rather than arbitrary sleeps. Checkpoint 7 adds HTTP financial endpoints, OAuth/OIDC, Keycloak and internal OPENING. Automatic reference resolution remains deferred.
+
+## HTTP/authentication checkpoint 7
+
+**Implemented.** net/http exposes POST /wagering/transactions, GET /wagering/transactions/{id}, GET /providers/{provider}/wagering/transactions/{external}, POST /wallets, GET /wallets/{id}, GET /wallets/{id}/ledger and POST /wallets/{id}/reconciliation. HTTP POST operations call the existing Processor.Process; SQS ProcessMessage still uses the same private financial execution. No handler-level locks or financial idempotency cache are introduced. Input is limited to 64 KiB, decoded into strict DTOs, and monetary values use Money.Parse. Bodies containing unknown fields or multiple JSON values are rejected. Optional references may be omitted/null. Authenticated handlers have a 20-second context deadline.
+
+### Authentication and permissions
+
+Keycloak 26.0.7 is pinned in Compose with deterministic realm `wager` import. Development confidential clients provider-a, provider-b and wallet-internal use client_credentials only; interactive/direct-password flows are disabled. Audience mapper adds wager-api to access tokens. Fake local secrets are explicitly development-only. The API discovers the configured issuer at startup and fails closed if discovery fails. Authentication is never optional in the production composition.
+
+The coreos/go-oidc v3 verifier uses discovery/JWKS, RS256 signatures, exact issuer, required audience and expiration checks; nbf is also checked explicitly without accepting future activation. Signing keys are resolved/cached by the library. JWT is not merely decoded. A five-second HTTP client timeout bounds discovery/key requests. The narrow access.Principal contains only ProviderID/Internal; domain packages have no authentication dependency.
+
+A verified azp client maps to provider identity through OIDC_PROVIDER_CLIENTS. The default mappings are provider-a -> provider-a and provider-b -> provider-b. Only the configured OIDC_INTERNAL_CLIENT (wallet-internal) can create/read/reconcile wallets or inspect ledger/metrics. Provider clients can submit and read only their own external transactions. The internal wallet client does not implicitly impersonate a provider. POST providerId must match the verified mapping; it never selects the financial namespace. GET queries always include the authenticated provider in SQL; mismatched path providers and other providers' transaction IDs return NOT_FOUND without querying or exposing their data.
+
+OIDC_ISSUER defaults to http://localhost:8081/realms/wager, OIDC_AUDIENCE to wager-api, OIDC_INTERNAL_CLIENT to wallet-internal. Empty/invalid issuer, audience or client mappings are rejected. Keycloak advertises the host-reachable issuer http://localhost:8081. The application currently runs on the host; Compose runs its dependencies. An application container must reach the same advertised issuer (for example with host networking on supported setups), or both Keycloak hostname and OIDC_ISSUER must be changed to a shared reachable hostname. Merely substituting the Docker service hostname in the verifier would violate issuer matching.
+
+### HTTP results and errors
+
+The README requires distinct outcomes but does not prescribe numeric statuses. Implemented choices: 201 for wallet creation; 200 for processed operations/replays and reads; 202 for PENDING/PENDING_REFERENCE; 422 for durable REJECTED (also on replay); 400 for invalid JSON/Money/input or missing idempotency key; 401 for absent/invalid tokens; 403 for insufficient permission or POST provider mismatch; 404 for unavailable/provider-hidden resources; 409 for idempotency or player/currency uniqueness conflicts; 500 for invalid persisted state; 503 for infrastructure/capacity failures. Stable error DTOs contain only an error code. SQL errors, stack traces and verification details are not exposed.
+
+POST responses include transactionId, status, optional balance, idempotentReplay and nullable failureCode. Saved historical balance is returned on replay. Transaction reads expose original public context, status/failure, saved balance and timestamps, but never hash, idempotency bindings, resolved internal reference or reference deadline. The exact Idempotency-Key header is mandatory; no key is synthesized. Health endpoints are public: live reports process liveness; ready checks PostgreSQL and availability of inbound/outbound SQS queues with a three-second deadline. Listener binding happens synchronously during OnStart so a bind error fails startup.
+
+### Wallet creation, opening and reads
+
+The README's positive wallet creation requirement makes OPENING necessary here. NewOpening creates an internal terminal PROCESSED domain entity with positive Money and private state; external NewExternal and both public input transports continue rejecting OPENING. WalletService builds the wallet at version 1 and, only for positive initial balance, constructs OPENING, one CREDIT ledger entry from zero, WagerTransactionProcessed and WalletBalanceChanged. The PostgreSQL store commits these together; a failure rolls back wallet creation. Initial zero creates only the wallet. Duplicate player/currency remains a database-enforced conflict.
+
+Migration 000007 permits NULL provider/external/round/game/hash only for OPENING, requires those fields for external operations, and adds explicit origin constraints. Internal opening requires PROCESSED, no references/failure, positive amount and matching saved result. A partial unique index on wallet_id for OPENING prevents duplicate initial credits. No previous migration is rewritten. DOWN refuses existing opening history. Rehydration supports the internal shape without applying effects. Opening processed events omit irrelevant external metadata; balance events retain the existing v1 shape with walletVersion=1.
+
+Ledger reads use ascending (created_at,id), an opaque base64url cursor bound to wallet ID, default page size 50 and maximum 100. This is stable keyset pagination, not a multi-page snapshot guarantee. Reconciliation uses one PostgreSQL statement/snapshot for stored balance and the signed sum of immutable ledger amounts, including opening. PostgreSQL NUMERIC is used only for exact aggregate accumulation before checked int64 conversion; no floating-point conversion occurs. Difference is stored minus calculated. Divergences increment a process-local diagnostic counter exposed on internal-only GET /metrics and produce a structured JSON warning. Reconciliation never changes balance. This small metric is not an observability stack or a financial coordination mechanism.
+
+### Verification and remaining scope
+
+Unit tests use a real RSA/JWKS verifier for signature, issuer, audience, expiration, nbf, client mapping and malformed/unsigned tokens; HTTP boundary fakes are test-only. PostgreSQL HTTP tests cover all external kinds, referenced WIN, pending/rejected outcomes, aliases/conflicts, historical replay, provider isolation, wallet/ledger/reconciliation and two concurrent HTTP instances betting 80 against 100. Opening tests verify zero/positive paths, atomic rollback and migration UP/DOWN/UP/refused destructive downgrade. `integration,oidcintegration` runs a real Keycloak client_credentials -> actual HTTP server -> PostgreSQL/ledger/outbox smoke flow and cross-provider denial. `integration,sqsintegration,oidcintegration` combines all current integrations.
+
+Automatic pending-reference resolution, final deployment/Dockerfile packaging, broader observability/recovery demonstrations, production credential/IAM policy and the required three-independent-OS-process scenario remain unfinished. This checkpoint does not claim complete challenge compliance.
 
 ## Concurrency direction
 
@@ -331,9 +365,9 @@ Checkpoint 5 defines snapshots, concurrent claims, retries and recovery. Checkpo
 
 Reference resolution, strict expiration, and reversal exclusivity are implemented below. Automatic scheduling/backoff and the background resolver remain deferred.
 
-### OAuth2/OIDC authorization — To be decided
+### OAuth2/OIDC authorization — Implemented HTTP boundary
 
-External identity provider, credential validation, provider identity mapping, permissions for internal wallet operations, and broker access policies. Authentication is not implemented.
+Checkpoint 7 implements Keycloak token validation and client-to-provider/internal authorization. Production broker/IAM policies remain a deployment responsibility.
 
 ### SQS retry and DLQ policy — Implemented
 

@@ -7,6 +7,7 @@ import (
 )
 
 type Config struct {
+	OIDC                OIDCConfig
 	Messaging           MessagingConfig
 	HTTP                HTTPConfig
 	DatabaseURL         string
@@ -41,6 +42,10 @@ func Load() (*Config, error) {
 	}
 	cfg.ReferencePendingTTL = ttl
 	cfg.Messaging, err = loadMessaging()
+	if err != nil {
+		return nil, err
+	}
+	cfg.OIDC, err = loadOIDC()
 	if err != nil {
 		return nil, err
 	}

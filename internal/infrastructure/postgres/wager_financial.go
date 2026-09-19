@@ -62,6 +62,7 @@ func (r *WagerTransactionRepository) CompleteOutcome(ctx context.Context, t *wt.
 
 func scanFinancial(row pgx.Row) (financial.Record, error) {
 	var s wt.State
+	var provider, external, round, game *string
 	var n int64
 	var c string
 	var reference, code, resultCurrency *string
@@ -69,8 +70,20 @@ func scanFinancial(row pgx.Row) (financial.Record, error) {
 	var balance *int64
 	var referenceID *string
 	var deadline *time.Time
-	if err := row.Scan(&s.ID, &s.ProviderID, &s.ExternalTransactionID, &s.PlayerID, &s.WalletID, &s.RoundID, &s.GameID, &s.Kind, &n, &c, &reference, &s.Status, &code, &s.CreatedAt, &s.UpdatedAt, &hash, &balance, &resultCurrency, &referenceID, &deadline); err != nil {
+	if err := row.Scan(&s.ID, &provider, &external, &s.PlayerID, &s.WalletID, &round, &game, &s.Kind, &n, &c, &reference, &s.Status, &code, &s.CreatedAt, &s.UpdatedAt, &hash, &balance, &resultCurrency, &referenceID, &deadline); err != nil {
 		return financial.Record{}, scanError(err)
+	}
+	if provider != nil {
+		s.ProviderID = *provider
+	}
+	if external != nil {
+		s.ExternalTransactionID = *external
+	}
+	if round != nil {
+		s.RoundID = *round
+	}
+	if game != nil {
+		s.GameID = *game
 	}
 	if reference != nil {
 		if *reference == "" {
@@ -95,10 +108,11 @@ func scanFinancial(row pgx.Row) (financial.Record, error) {
 	if err != nil {
 		return financial.Record{}, persistedError(err)
 	}
-	if len(hash) != 32 || (balance == nil) != (resultCurrency == nil) {
+	if (s.Kind != wt.OPENING && len(hash) != 32) || (s.Kind == wt.OPENING && len(hash) != 0) || (balance == nil) != (resultCurrency == nil) {
 		return financial.Record{}, persistedError(financial.ErrInvalidPersistedData)
 	}
-	record := financial.Record{Transaction: t, PayloadHash: [32]byte(hash), ReferenceDeadline: deadline}
+	record := financial.Record{Transaction: t, ReferenceDeadline: deadline}
+	copy(record.PayloadHash[:], hash)
 	if referenceID != nil {
 		if *referenceID == "" || *referenceID == t.ID() || t.ReferenceExternalTransactionID() == "" {
 			return financial.Record{}, persistedError(wt.ErrInvalidReference)

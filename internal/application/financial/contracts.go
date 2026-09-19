@@ -13,6 +13,7 @@ import (
 )
 
 var (
+	ErrWalletExists         = errors.New("duplicate wallet identity")
 	ErrInvalidInput         = errors.New("invalid financial input")
 	ErrUnsupportedOperation = errors.New("unsupported financial operation")
 	ErrInvalidContext       = errors.New("invalid wallet/player context")

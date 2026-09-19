@@ -464,3 +464,54 @@ go vet ./...
 Documente separadamente como preparar as dependências dos testes e executar integração, múltiplas instâncias e simulações de falha. Se utilizar build tags, informe os comandos correspondentes.
 
 Entregue código formatado com `gofmt` e dependências reproduzíveis.
+
+
+## Execução local implementada (checkpoints 1–7)
+
+A API Go roda no host; PostgreSQL, SQS/LocalStack e Keycloak rodam no Compose.
+
+```sh
+docker compose up -d --wait postgres localstack keycloak
+docker compose run --rm migrate up
+export DATABASE_URL='postgres://wager:local_only@localhost:5432/wager?sslmode=disable'
+export AWS_REGION=us-east-1 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test
+export SQS_ENDPOINT=http://localhost:4566
+export OIDC_ISSUER=http://localhost:8081/realms/wager OIDC_AUDIENCE=wager-api
+go run ./cmd/api
+```
+
+Ajuste a URL PostgreSQL para as credenciais/porta do seu `.env`. O programa Go não carrega `.env` automaticamente. Credenciais abaixo são **somente locais e fictícias**. Keycloak: `http://localhost:8081`, realm `wager`. Clientes `provider-a`, `provider-b`, `wallet-internal`; secrets `local-provider-a-secret`, `local-provider-b-secret`, `local-wallet-internal-secret`.
+
+```sh
+INTERNAL_TOKEN=$(curl -fsS http://localhost:8081/realms/wager/protocol/openid-connect/token \
+  -d grant_type=client_credentials -d client_id=wallet-internal \
+  -d client_secret=local-wallet-internal-secret | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+curl -fsS http://localhost:8080/wallets -H "Authorization: Bearer $INTERNAL_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"playerId":"local-player","initialBalance":{"amount":"100.00","currency":"BRL"}}'
+
+PROVIDER_TOKEN=$(curl -fsS http://localhost:8081/realms/wager/protocol/openid-connect/token \
+  -d grant_type=client_credentials -d client_id=provider-a \
+  -d client_secret=local-provider-a-secret | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+# Substitua WALLET_ID pelo id retornado na abertura.
+curl -sS http://localhost:8080/wagering/transactions \
+  -H "Authorization: Bearer $PROVIDER_TOKEN" -H 'Idempotency-Key: local-bet-1' \
+  -H 'Content-Type: application/json' \
+  -d '{"providerId":"provider-a","externalTransactionId":"local-bet-1","playerId":"local-player","walletId":"WALLET_ID","roundId":"round-1","gameId":"game-1","kind":"BET","money":{"amount":"80.00","currency":"BRL"}}'
+```
+
+GET `/health/live` e `/health/ready` são públicos. Operações de carteira exigem o cliente interno; operações externas usam o provider associado ao token. Estados pendentes retornam 202, rejeições de negócio 422, conflito de idempotência 409. Mais contratos e escolhas estão em `ARCHITECTURE.md`.
+
+Testes usam schemas PostgreSQL e filas temporárias isolados. A conta de teste precisa poder criar schemas.
+
+```sh
+export TEST_DATABASE_URL="$DATABASE_URL"
+export TEST_SQS_ENDPOINT=http://localhost:4566
+export TEST_OIDC_ISSUER=http://localhost:8081/realms/wager
+go test ./...
+go test -race ./...
+go test -tags=integration,sqsintegration,oidcintegration -count=1 ./...
+go test -race -tags=integration,sqsintegration,oidcintegration -count=1 ./...
+```
+
+A imagem Keycloak anuncia o issuer `http://localhost:8081/realms/wager`; aplicações em containers devem usar um hostname alcançável e idêntico no Keycloak e no verificador. Não há bypass de autenticação no modo normal. Resolução automática de referências pendentes e os demais itens marcados como adiados em `ARCHITECTURE.md` ainda não estão implementados.

@@ -13,7 +13,7 @@ import (
 
 var (
 	ErrNotFound                   = financial.ErrNotFound
-	ErrDuplicateWalletIdentity    = errors.New("duplicate wallet identity")
+	ErrDuplicateWalletIdentity    = financial.ErrWalletExists
 	ErrDuplicateFinancialIdentity = errors.New("duplicate financial identity")
 	ErrStaleWalletWrite           = errors.New("stale wallet write")
 	ErrStaleOutcomeWrite          = errors.New("stale transaction outcome write")

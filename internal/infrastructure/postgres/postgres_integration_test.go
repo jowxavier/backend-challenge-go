@@ -62,7 +62,7 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 	files, err := filepath.Glob("../../../migrations/*.up.sql")
-	if err != nil || len(files) != 6 {
+	if err != nil || len(files) != 7 {
 		t.Fatalf("migrations: %v %v", files, err)
 	}
 	for _, file := range files {

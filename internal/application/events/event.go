@@ -181,3 +181,24 @@ func Restore(raw []byte) (Event, error) {
 	}
 	return Event{v.ID, v.CorrelationID, v.AggregateID, v.Type, v.At.UTC(), v.Version, string(raw)}, nil
 }
+
+// NewOpeningProcessed omits provider metadata that does not apply to internal creation.
+func NewOpeningProcessed(t *wt.WagerTransaction) (Event, error) {
+	if t == nil || t.Kind() != wt.OPENING || t.Status() != wt.PROCESSED {
+		return Event{}, ErrInvalidEvent
+	}
+	m, err := decimal(t.Money())
+	if err != nil {
+		return Event{}, err
+	}
+	data := struct {
+		TransactionID string       `json:"transactionId"`
+		PlayerID      string       `json:"playerId"`
+		WalletID      string       `json:"walletId"`
+		Kind          wt.Kind      `json:"kind"`
+		Status        wt.Status    `json:"status"`
+		Money         decimalMoney `json:"money"`
+		Balance       decimalMoney `json:"resultingBalance"`
+	}{t.ID(), t.PlayerID(), t.WalletID(), t.Kind(), t.Status(), m, m}
+	return build(Processed, t.ID(), t.ID(), t.UpdatedAt(), data)
+}

@@ -15,6 +15,7 @@ import (
 type Kind string
 
 const (
+	OPENING  Kind = "OPENING"
 	BET      Kind = "BET"
 	WIN      Kind = "WIN"
 	LOSS     Kind = "LOSS"
@@ -80,6 +81,9 @@ type WagerTransaction struct {
 }
 
 func NewExternal(input ExternalInput, at time.Time) (*WagerTransaction, error) {
+	if input.Kind == OPENING {
+		return nil, ErrInvalidKind
+	}
 	return Rehydrate(State{ExternalInput: input, Status: PENDING, CreatedAt: at.UTC(), UpdatedAt: at.UTC()})
 }
 
@@ -93,6 +97,9 @@ type State struct {
 
 func Rehydrate(s State) (*WagerTransaction, error) {
 	input := s.ExternalInput
+	if input.Kind == OPENING {
+		return rehydrateOpening(s)
+	}
 	for _, field := range []struct{ name, value string }{
 		{"id", input.ID}, {"providerId", input.ProviderID}, {"externalTransactionId", input.ExternalTransactionID},
 		{"playerId", input.PlayerID}, {"walletId", input.WalletID}, {"roundId", input.RoundID}, {"gameId", input.GameID},
