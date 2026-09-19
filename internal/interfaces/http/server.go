@@ -3,6 +3,7 @@ package http
 import (
 	"context"
 	"fmt"
+	"github.com/jowxavier/backend-challenge-go/internal/observability"
 	"net"
 	"net/http"
 	"time"
@@ -36,7 +37,7 @@ func NewServer(lc fx.Lifecycle, cfg *config.Config, api *API) *Server {
 			}
 			go func() {
 				if err := srv.server.Serve(listener); err != nil && err != http.ErrServerClosed {
-					fmt.Printf("http server error: %v\n", err)
+					observability.Logger.Error("HTTP server stopped unexpectedly")
 				}
 			}()
 

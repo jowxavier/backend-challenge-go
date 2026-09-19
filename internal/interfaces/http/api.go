@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jowxavier/backend-challenge-go/internal/observability"
 	"io"
 	"net/http"
 	"strconv"
@@ -122,9 +123,10 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /wallets/{id}/reconciliation", a.protected(true, a.reconcile))
 	mux.HandleFunc("GET /metrics", a.protected(true, func(w http.ResponseWriter, r *http.Request, p access.Principal) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		observability.Write(w)
 		fmt.Fprintf(w, "wallet_reconciliation_divergences_total %d\n", a.wallets.Divergences())
 	}))
-	return mux
+	return loggedHTTP(mux)
 }
 func (a *API) process(w http.ResponseWriter, r *http.Request, p access.Principal) {
 	var body struct {
@@ -151,7 +153,7 @@ func (a *API) process(w http.ResponseWriter, r *http.Request, p access.Principal
 		fail(w, 400, "INVALID_IDEMPOTENCY_KEY")
 		return
 	}
-	m, err := money.Parse(body.Money.Amount, body.Money.Currency)
+	m, err := parseExternalMoney(body.Money.Amount, body.Money.Currency)
 	if err != nil {
 		fail(w, 400, "INVALID_MONEY")
 		return
@@ -217,7 +219,7 @@ func (a *API) createWallet(w http.ResponseWriter, r *http.Request, _ access.Prin
 		fail(w, 400, "INVALID_JSON")
 		return
 	}
-	m, err := money.Parse(body.Balance.Amount, body.Balance.Currency)
+	m, err := parseExternalMoney(body.Balance.Amount, body.Balance.Currency)
 	if err != nil {
 		fail(w, 400, "INVALID_MONEY")
 		return
@@ -279,4 +281,16 @@ func mapError(w http.ResponseWriter, err error) {
 	default:
 		fail(w, 503, "SERVICE_UNAVAILABLE")
 	}
+}
+
+func parseExternalMoney(amount, currency string) (money.Money, error) {
+	m, err := money.Parse(amount, currency)
+	if err != nil {
+		return m, err
+	}
+	c, _ := m.Currency()
+	if c != "BRL" {
+		return money.Money{}, money.ErrInvalidCurrency
+	}
+	return m, nil
 }

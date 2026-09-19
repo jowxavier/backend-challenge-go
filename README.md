@@ -466,7 +466,7 @@ Documente separadamente como preparar as dependências dos testes e executar int
 Entregue código formatado com `gofmt` e dependências reproduzíveis.
 
 
-## Execução local implementada (checkpoints 1–7)
+## Execução local implementada (checkpoints 1–8)
 
 A API Go roda no host; PostgreSQL, SQS/LocalStack e Keycloak rodam no Compose.
 
@@ -514,4 +514,31 @@ go test -tags=integration,sqsintegration,oidcintegration -count=1 ./...
 go test -race -tags=integration,sqsintegration,oidcintegration -count=1 ./...
 ```
 
-A imagem Keycloak anuncia o issuer `http://localhost:8081/realms/wager`; aplicações em containers devem usar um hostname alcançável e idêntico no Keycloak e no verificador. Não há bypass de autenticação no modo normal. Resolução automática de referências pendentes e os demais itens marcados como adiados em `ARCHITECTURE.md` ainda não estão implementados.
+A imagem Keycloak anuncia o issuer `http://localhost:8081/realms/wager`; aplicações em containers devem usar um hostname alcançável e idêntico no Keycloak e no verificador. Não há bypass de autenticação no modo normal. O worker de referências pendentes inicia automaticamente e retoma o agendamento persistido após reinício. Entradas financeiras HTTP/SQS e abertura de carteira suportam BRL; Money mantém operações genéricas entre moedas compatíveis.
+
+
+### Verificação final e empacotamento
+
+Aplique também a migration 000008 antes de iniciar os workers. Para consultar a
+versão: `docker compose run --rm migrate version`. Em banco descartável, reverta
+somente a última migration com `docker compose run --rm migrate down 1` e reaplique
+com `docker compose run --rm migrate up`. Downgrades que apagariam histórico
+financeiro podem ser recusados pelas migrations anteriores.
+
+```sh
+docker build -t backend-challenge-go:test .
+# Com as variáveis TEST_* acima exportadas:
+go test -tags=integration,sqsintegration,oidcintegration -count=1 ./...
+go test -race -tags=integration,sqsintegration,oidcintegration -count=1 ./...
+go test -tags=integration -run 'TestThreeIndependentProcesses|TestReferenceWorkerProcessRestart|TestReferenceWorkerRecovery' -count=1 ./internal/infrastructure/postgres
+go test -tags=integration,sqsintegration -run TestHTTPAndSQSConcurrentIdentity -count=1 ./internal/infrastructure/postgres
+```
+
+O teste de três processos cria subprocessos com conexões/memória próprias; o
+outro teste reinicia um processo que executa o worker real. O teste HTTP/SQS usa
+LocalStack e PostgreSQL reais. `/metrics` exige token interno, expõe contadores
+por processo, atraso da outbox e profundidade aproximada da DLQ. Políticas AWS
+mínimas e limites da emulação estão em [deploy/iam](deploy/iam/README.md).
+A imagem roda como usuário não-root na porta 8080; ao executá-la, configure
+DATABASE_URL, SQS_ENDPOINT e um OIDC_ISSUER alcançável e idêntico ao issuer do
+Keycloak. A execução no host continua sendo o caminho local padrão.

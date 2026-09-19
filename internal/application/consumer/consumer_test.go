@@ -178,3 +178,11 @@ func TestConsumerShutdown(t *testing.T) {
 		})
 	}
 }
+
+func TestUnsupportedCurrency(t *testing.T) {
+	for _, currency := range []string{"USD", "ZZZ"} {
+		if _, err := Decode(strings.Replace(body, "brl", currency, 1), "consumer"); err == nil {
+			t.Fatal("unsupported currency", currency)
+		}
+	}
+}

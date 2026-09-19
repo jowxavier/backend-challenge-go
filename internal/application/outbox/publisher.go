@@ -3,6 +3,7 @@ package outbox
 import (
 	"context"
 	"errors"
+	"github.com/jowxavier/backend-challenge-go/internal/observability"
 	"time"
 
 	"github.com/jowxavier/backend-challenge-go/internal/application/events"
@@ -80,6 +81,10 @@ func (s *Service) RunOnce(ctx context.Context) (bool, error) {
 	publishCtx, cancel := context.WithTimeout(ctx, s.cfg.PublishTimeout)
 	err = s.publisher.Publish(publishCtx, c.Event)
 	cancel()
+	observability.Logger.Info("outbox publish", "eventId", c.Event.ID(), "transactionId", c.Event.TransactionID(), "failed", err != nil)
+	if err != nil {
+		observability.Retries.Add(1)
+	}
 	at := s.now().UTC()
 	if at.IsZero() {
 		return true, errors.Join(err, ErrInvalidConfig)

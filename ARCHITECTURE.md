@@ -12,7 +12,7 @@ Configuration, application composition, an HTTP server, the Money value object, 
 
 **Implemented.** [`cmd/api/main.go`](cmd/api/main.go) is the composition root. Fx provides constructor dependency injection through `fx.Provide` and instantiates the HTTP server through `fx.Invoke`.
 
-The HTTP server uses `net/http` and `fx.Lifecycle`: `OnStart` launches `ListenAndServe` in a goroutine, and `OnStop` calls `Shutdown` with the lifecycle context for graceful shutdown. Currently, serving errors are printed and are not propagated to Fx; successful startup does not confirm that the listener bound successfully. Worker lifecycle and resource shutdown ordering remain undecided.
+The HTTP server binds its listener synchronously in Fx OnStart; bind errors fail startup. OnStop calls Shutdown. Messaging stops receives/claims, drains or cancels bounded work and joins workers before PostgreSQL closes. The reference worker and metrics sampler share this lifecycle.
 
 ## Configuration
 
@@ -47,7 +47,7 @@ Amounts must be valid, non-negative Money in the wallet currency. Insufficient f
 
 Valid zero credits/debits are no-ops: balance, version, and timestamps remain unchanged, consistent with the README's balance-change version rule. Positive changes increment the version exactly once; version overflow is rejected. The application layer supplies processing timestamps, stored in UTC. Creation and balance-changing operations require non-zero timestamps. Timestamp ordering is not a Wallet invariant; earlier timestamps are accepted. Valid zero operations require no timestamp, but still validate the Wallet, Money, and currency. `createdAt` never changes.
 
-This checkpoint enforces only in-memory balance invariants and creates no ledger entries or events. Global uniqueness of `(playerId, currency)` is enforced by the initial schema. The financial processor now commits balance changes together with ledger entries and saved outcomes for BET/WIN; messaging and the remaining operations are deferred. Repository locking is described below.
+This checkpoint enforces only in-memory balance invariants and creates no ledger entries or events. Global uniqueness of `(playerId, currency)` is enforced by the initial schema. The financial processor commits balance changes, ledger, saved outcomes and events atomically for all external operations; positive opening is also atomic. Repository locking is described below.
 
 ## WagerTransaction
 
@@ -111,7 +111,7 @@ export DATABASE_URL="$TEST_DATABASE_URL"
 go run ./cmd/api
 ```
 
-Checkpoint 3 implements ledger, financial orchestration, and idempotency below. Multi-process financial scenarios remain deferred; outbox and Inbox are implemented in checkpoints 5 and 6 below. Reference processing is implemented in checkpoint 4 below. No transaction retry or worker machinery is introduced.
+Checkpoint 3 implements ledger, financial orchestration, and idempotency below. Checkpoint 8 verifies independent-process financial scenarios; outbox and Inbox are implemented in checkpoints 5 and 6 below. Reference processing is implemented in checkpoint 4 below. No transaction retry or worker machinery is introduced.
 
 ## Persistence/application checkpoint 3
 
@@ -153,7 +153,7 @@ Migration 000003 adds fingerprint/results, supporting composite keys, key bindin
 
 Integration fixtures apply all three migrations to isolated schemas. Tests cover financial outcomes and replay, key conflicts/aliases, schema constraints and append-only protection, real transaction rollback at multiple write stages, database-raised failure, independent-wallet progress, two concurrent BET 80.00 against 100.00, 50 distinct operations, 50 duplicate copies, and concurrent aliases. Synchronization uses channels and PostgreSQL lock observation rather than sleeps. UP/DOWN/UP and refusal of a populated legacy dataset are tested. Positive initial balances are fixtures; ledger assertions cover checkpoint deltas, not complete from-zero reconciliation without OPENING.
 
-Run all integration tests with the TEST_DATABASE_URL setup above, both normally and with -race. Three independent process verification is required later; concurrent connections/goroutines are not claimed as its substitute. Checkpoint 4 extends this processor with reference operations below. OPENING, HTTP financial endpoints, OAuth/OIDC, and pending-reference recovery workers remain deferred; Inbox/SQS are implemented in checkpoint 6. Checkpoint 5 adds outbox persistence and explicit delivery invocations. This checkpoint does not claim full challenge compliance or event-delivery guarantees.
+Run all integration tests with the TEST_DATABASE_URL setup above, both normally and with -race. Checkpoint 8 adds independent OS processes; these older tests cover connections/goroutines. Checkpoint 4 extends this processor with reference operations below. Checkpoint 7 adds OPENING, HTTP and OAuth/OIDC; checkpoint 8 adds automatic pending recovery. Inbox/SQS are implemented in checkpoint 6. Checkpoint 5 adds outbox persistence and explicit delivery invocations. This checkpoint does not claim full challenge compliance or event-delivery guarantees.
 
 ## Persistence/application checkpoint 4
 
@@ -194,7 +194,7 @@ Migration 000004 adds reference_transaction_id, reference_deadline_at, provider/
 
 Tests cover reference directions, contextual validation, provider isolation, pending/terminal references, aliases, strict expiration with an injected clock, historical replay, rollback of resolver failures, and the independent database uniqueness constraint. Channel barriers and observed PostgreSQL lock dependencies exercise competing reversals, two resolvers, replay versus resolver, and original versus reversal in both lock orders. Goroutines are cancelled and joined before cleanup; no sleeps establish correctness. Checkpoint 3 regression scenarios remain in the integration suite.
 
-Background reference resolution/backoff and three-process verification remain deferred; checkpoint 7 adds HTTP, OAuth/OIDC, Keycloak and internal OPENING. Checkpoint 6 implements Inbox/SQS and messaging workers. Outbox delivery is described in checkpoint 5 below. This is not complete challenge compliance.
+Checkpoint 8 adds background reference resolution/backoff and three-process verification; checkpoint 7 adds HTTP, OAuth/OIDC, Keycloak and internal OPENING. Checkpoint 6 implements Inbox/SQS and messaging workers. Outbox delivery is described in checkpoint 5 below. This is not complete challenge compliance.
 
 ## Persistence/application checkpoint 5 — Transactional outbox
 
@@ -250,7 +250,7 @@ Unit tests cover concrete snapshots, null fields, exact Money formatting, invali
 
 The JSON envelope requires messageId, type=WagerTransactionRequested, occurredAt and typed data matching the README. Money is parsed from strings through the existing Money parser. referenceExternalTransactionId may be absent/null. Unknown envelope fields/types, invalid JSON, invalid envelope identity/timestamp and invalid Money are rejected. occurredAt is metadata; processing still uses the injected application clock. The exact received body bytes are preserved for SHA-256.
 
-The queue is a **trusted internal transport boundary**. Only trusted/internal producers may submit commands; providerId comes from their envelope and is not authenticated merely by SQS receipt. External-provider authentication and IAM deployment policies are not implemented. Local fake credentials/emulation do not prove production access control. Existing financial/reference provider scoping is unchanged.
+The queue is a **trusted internal transport boundary**. Only trusted/internal producers may submit commands; providerId comes from their envelope and is not authenticated merely by SQS receipt. HTTP authenticates external providers; deploy/iam contains scoped runtime and trusted-producer identity policy examples. Local fake credentials/emulation do not prove production access control. Existing financial/reference provider scoping is unchanged.
 
 ### Inbox transaction
 
@@ -264,7 +264,7 @@ On conflict, a fresh SELECT sees the winner's committed record. Same hash/comple
 
 ### Consumer, retry and deletion
 
-Each configurable worker receives at most one message and calls the application coordinator. DeleteMessage follows confirmed processing only: PROCESSED, REJECTED, PENDING_REFERENCE, financial replay and completed Inbox duplicate. Pending-reference completion does not resolve the dependency or extend its deadline. The automatic reference resolver remains deferred.
+Each configurable worker receives at most one message and calls the application coordinator. DeleteMessage follows confirmed processing only: PROCESSED, REJECTED, PENDING_REFERENCE, financial replay and completed Inbox duplicate. Pending-reference completion does not resolve the dependency or extend its deadline. The automatic reference worker is implemented in checkpoint 8.
 
 Malformed/unsupported commands, invalid input, identity/hash conflicts and infrastructure/timeout/ambiguous-commit failures are not deleted as success. No artificial financial rejection or Inbox identity is fabricated for malformed input. ChangeMessageVisibility uses ApproximateReceiveCount with 1s, 2s, 4s... capped at 60s. Visibility-change failure leaves recovery to the existing timeout. Poison messages reach the FIFO DLQ through native redrive; the application never manually sends to DLQ and deletes. A delete failure allows safe redelivery. No in-memory deduplication exists.
 
@@ -293,7 +293,7 @@ go test -tags=integration -count=1 ./...
 TEST_SQS_ENDPOINT=http://localhost:4566 go test -tags=integration,sqsintegration -count=1 ./...
 ```
 
-All integration commands require TEST_DATABASE_URL. Tests isolate PostgreSQL schemas and SQS queue names. Tests cover atomic completion/rollback, duplicates/restart/hash conflict, financial replay, ambiguous commit, concurrent same/independent Inbox identities, rejection/pending completion, migration UP/DOWN/UP, real SQS re-delivery/delete, native poison redrive, transient visibility retry, exact outbound snapshots, ambiguous sends and multiple consumers. A real Fx lifecycle test exercises queued work, consumer processing, outbox publication and shutdown. Concurrency assertions use barriers; broker waits use bounded receives rather than arbitrary sleeps. Checkpoint 7 adds HTTP financial endpoints, OAuth/OIDC, Keycloak and internal OPENING. Automatic reference resolution remains deferred.
+All integration commands require TEST_DATABASE_URL. Tests isolate PostgreSQL schemas and SQS queue names. Tests cover atomic completion/rollback, duplicates/restart/hash conflict, financial replay, ambiguous commit, concurrent same/independent Inbox identities, rejection/pending completion, migration UP/DOWN/UP, real SQS re-delivery/delete, native poison redrive, transient visibility retry, exact outbound snapshots, ambiguous sends and multiple consumers. A real Fx lifecycle test exercises queued work, consumer processing, outbox publication and shutdown. Concurrency assertions use barriers; broker waits use bounded receives rather than arbitrary sleeps. Checkpoint 7 adds HTTP financial endpoints, OAuth/OIDC, Keycloak and internal OPENING. Automatic reference resolution is implemented in checkpoint 8.
 
 ## HTTP/authentication checkpoint 7
 
@@ -327,43 +327,43 @@ Ledger reads use ascending (created_at,id), an opaque base64url cursor bound to 
 
 Unit tests use a real RSA/JWKS verifier for signature, issuer, audience, expiration, nbf, client mapping and malformed/unsigned tokens; HTTP boundary fakes are test-only. PostgreSQL HTTP tests cover all external kinds, referenced WIN, pending/rejected outcomes, aliases/conflicts, historical replay, provider isolation, wallet/ledger/reconciliation and two concurrent HTTP instances betting 80 against 100. Opening tests verify zero/positive paths, atomic rollback and migration UP/DOWN/UP/refused destructive downgrade. `integration,oidcintegration` runs a real Keycloak client_credentials -> actual HTTP server -> PostgreSQL/ledger/outbox smoke flow and cross-provider denial. `integration,sqsintegration,oidcintegration` combines all current integrations.
 
-Automatic pending-reference resolution, final deployment/Dockerfile packaging, broader observability/recovery demonstrations, production credential/IAM policy and the required three-independent-OS-process scenario remain unfinished. This checkpoint does not claim complete challenge compliance.
+Checkpoint 8 adds automatic reference recovery, a Dockerfile, required operational metrics/logs, IAM examples and independent-process/cross-transport verification. LocalStack is not evidence of production IAM enforcement.
 
 ## Concurrency direction
 
-**Implemented at repository level.** Wallet `GetForUpdate` uses PostgreSQL row locking within an existing READ COMMITTED transaction. No process-local or global locks provide correctness. Tests prove lock contention and financial correctness across concurrent independent database transactions. Verification with three independent OS processes remains deferred.
+**Implemented at repository level.** Wallet `GetForUpdate` uses PostgreSQL row locking within an existing READ COMMITTED transaction. No process-local or global locks provide correctness. Tests prove lock contention and financial correctness across concurrent independent database transactions. An integration harness verifies three independent OS processes, each with its own pool, plus process restart and durable replay.
 
 ## Future decisions
 
 The following mechanisms remain incomplete; implemented checkpoint decisions above take precedence.
 
-### PostgreSQL transaction boundaries — To be decided
+### PostgreSQL transaction boundaries — Implemented
 
 pgx, application-owned transaction callbacks, and READ COMMITTED are implemented. Wallet, transaction, ledger, key bindings, and saved results are now grouped atomically. Outbox and Inbox now share that transaction.
 
-### Wallet concurrency control — To be decided
+### Wallet concurrency control — Implemented
 
-Per-wallet SELECT FOR UPDATE and expected-version guards are implemented. Lock ordering across multiple entities and application conflict recovery remain deferred.
+Per-wallet SELECT FOR UPDATE and expected-version guards are implemented. Wallet-before-wager locking applies to reference resolution; infrastructure failures roll back for safe retry.
 
-### Persistent idempotency — To be decided
+### Persistent idempotency — Implemented
 
-Implemented for the shared financial processor above; transport integration and recovery policy remain deferred.
+Shared HTTP/SQS execution uses persistent identity, canonical fingerprints and original saved results.
 
-### Ledger persistence and immutability — To be decided
+### Ledger persistence and immutability — Implemented
 
-Schema, immutable entries, and database protections are implemented above. Opening entries and consistent reconciliation reads remain deferred.
+Schema, immutable entries, and database protections are implemented above. Opening entries and consistent reconciliation reads are implemented.
 
 ### Inbox processing — Implemented
 
 Checkpoint 6 implements durable identity/hash, guarded completion and atomic financial integration.
 
-### Transactional outbox — Implemented core; transport deferred
+### Transactional outbox — Implemented
 
 Checkpoint 5 defines snapshots, concurrent claims, retries and recovery. Checkpoint 6 implements the SQS destination/adapter and production worker lifecycle.
 
-### Reference and reversal processing — To be decided
+### Reference and reversal processing — Implemented
 
-Reference resolution, strict expiration, and reversal exclusivity are implemented below. Automatic scheduling/backoff and the background resolver remain deferred.
+Reference resolution, strict expiration, and reversal exclusivity are implemented below. Automatic scheduling/backoff and restart recovery are described below.
 
 ### OAuth2/OIDC authorization — Implemented HTTP boundary
 
@@ -373,10 +373,48 @@ Checkpoint 7 implements Keycloak token validation and client-to-provider/interna
 
 Checkpoint 6 defines FIFO grouping guidance, visibility/processing timeouts, backoff, native redrive, poison-message handling and shutdown.
 
-### Observability — To be decided
+### Observability — Implemented
 
-Structured logging, correlation propagation, metrics, and dependency readiness checks. Currently, only `GET /health/live` is implemented; HTTP serving errors use plain text output.
+JSON operational logs, internal metrics, public liveness and PostgreSQL/SQS readiness are implemented; see checkpoint 8.
 
-### Failure recovery — To be decided
+### Failure recovery — Implemented
 
-Transient/permanent failure classification, durable resumption of accepted work, recovery of abandoned worker jobs, and validation through multi-instance crash/restart scenarios.
+Inbox/redelivery, leased outbox publication, scheduled reference recovery and process restart tests preserve committed financial history. Infrastructure errors roll back and retry; TTL produces a durable reference rejection.
+
+
+## Final checkpoint 8
+
+Reference scheduling adds reference_attempts and reference_next_attempt_at in
+migration 000008. A short atomic SKIP LOCKED claim advances the persisted schedule
+before calling the existing resolver, without holding a transaction-row lock
+while acquiring the wallet lock. Delays are 1, 2, 4, 8, 16, 32, then 60 seconds;
+the next attempt is capped at the original deadline. After expiration, failed
+infrastructure attempts retry every 60 seconds. TTL alone determines business
+exhaustion. Crash recovery uses the saved next attempt; overlapping attempts are
+financially safe through existing wallet locking and terminal guards. The worker
+polls empty/error results every second, bounds each attempt to 20 seconds and
+cancels/joins on shutdown. No new reference business rules are introduced.
+
+Operational JSON logs cover HTTP routes/status, financial outcomes and safe IDs,
+SQS handling, outbox sends and reference attempts. Raw transport errors, tokens
+and payloads are omitted. Internal GET /metrics exposes status counts, replay/
+duplicate counts, retries, PostgreSQL serialization/deadlock conflicts, processing
+latency and existing reconciliation divergences. Every 30 seconds a bounded
+sampler reads oldest unpublished outbox age and approximate visible DLQ depth.
+These diagnostic counters reset per process; gauges are last successful samples,
+not durable audit records. DLQ depth is a broker gauge, not a total redrive count.
+No tracing/dashboard service is required or installed.
+
+External HTTP financial/wallet input and SQS commands accept BRL only (including
+lowercase normalization). Money remains currency-generic with mismatch checks.
+Unsupported currencies fail validation, not financial mutation.
+
+Dockerfile builds with Go 1.26.5, modules/trimpath and a non-root distroless runtime.
+The API may still run on the host. Deployment broker identity policies are in
+deploy/iam; local fake credentials do not enforce that boundary.
+
+Tests launch three independent test-executable processes with their own pools,
+observe PostgreSQL lock waits before releasing the contention barrier, and verify
+an independent wallet advances. A replacement process replays persisted results.
+Another process-restart scenario automatically resumes pending references. Real
+HTTP and LocalStack command delivery overlap on one financial identity.

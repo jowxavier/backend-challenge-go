@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/jowxavier/backend-challenge-go/internal/observability"
 	"strings"
 	"time"
 	"unicode"
@@ -59,12 +60,16 @@ func (p *Processor) prepare(r ProcessRequest) (*wt.WagerTransaction, [32]byte, e
 	return tx, hash, nil
 }
 
-func (p *Processor) Process(ctx context.Context, r ProcessRequest) (ProcessResult, error) {
+func (p *Processor) Process(ctx context.Context, r ProcessRequest) (result ProcessResult, finalErr error) {
+	start := time.Now()
+	defer func() {
+		observability.Outcome(string(result.Status), result.IdempotentReplay, time.Since(start))
+		observability.Logger.Info("financial outcome", "providerId", r.ProviderID, "externalTransactionId", r.ExternalTransactionID, "walletId", r.WalletID, "transactionId", result.TransactionID, "correlationId", result.TransactionID, "status", result.Status, "failed", finalErr != nil)
+	}()
 	tx, hash, err := p.prepare(r)
 	if err != nil {
 		return ProcessResult{}, err
 	}
-	var result ProcessResult
 	err = p.transactions.WithinFinancialTransaction(ctx, func(repos Repositories) error {
 		result, err = p.process(ctx, repos, r, tx, hash)
 		return err

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/jowxavier/backend-challenge-go/internal/observability"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -35,6 +36,9 @@ func databaseError(err error) error {
 		return fmt.Errorf("%w: %w", ErrNotFound, err)
 	}
 	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && (pgErr.Code == "40001" || pgErr.Code == "40P01") {
+		observability.Conflicts.Add(1)
+	}
 	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 		switch pgErr.ConstraintName {
 		case "wallets_player_currency_unique":

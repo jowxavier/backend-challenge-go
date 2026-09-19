@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jowxavier/backend-challenge-go/internal/observability"
 	"io"
 	"strings"
 	"time"
@@ -79,6 +80,12 @@ func Decode(body string, consumerName string) (financial.Message, error) {
 		return financial.Message{}, ErrInvalidMessage
 	}
 	m, err := money.Parse(e.Data.Money.Amount, e.Data.Money.Currency)
+	if err == nil {
+		currency, _ := m.Currency()
+		if currency != "BRL" {
+			err = money.ErrInvalidCurrency
+		}
+	}
 	if err != nil {
 		return financial.Message{}, fmt.Errorf("%w: %w", ErrInvalidMessage, err)
 	}
@@ -98,10 +105,18 @@ func Backoff(count int) time.Duration {
 	}
 	return delay
 }
-func (s *Service) Handle(ctx context.Context, d Delivery) error {
+func (s *Service) Handle(ctx context.Context, d Delivery) (finalErr error) {
+	var messageID string
+	defer func() {
+		observability.Logger.Info("SQS handling", "messageId", messageID, "failed", finalErr != nil)
+		if finalErr != nil {
+			observability.Retries.Add(1)
+		}
+	}()
 	work, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 	m, err := Decode(d.Body, s.name)
+	messageID = m.MessageID
 	if err == nil {
 		_, err = s.processor.ProcessMessage(work, m)
 	}

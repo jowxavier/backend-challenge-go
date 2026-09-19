@@ -67,10 +67,14 @@ func Register(lc fx.Lifecycle, cfg *config.Config, pool *pgxpool.Pool, processor
 			workCtx, stopWork = context.WithCancel(context.Background())
 			done = make(chan struct{})
 			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() { defer wg.Done(); sampleMetrics(receiveCtx, pool, client, attrs.Attributes["RedrivePolicy"]) }()
 			for i := 0; i < c.Concurrency; i++ {
 				wg.Add(1)
 				go func() { defer wg.Done(); worker.Run(receiveCtx, workCtx) }()
 			}
+			wg.Add(1)
+			go func() { defer wg.Done(); (&postgres.ReferenceWorker{Pool: pool, Processor: processor}).Run(receiveCtx) }()
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
