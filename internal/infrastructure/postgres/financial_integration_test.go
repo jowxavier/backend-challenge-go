@@ -540,6 +540,10 @@ func TestIndependentWallets(t *testing.T) {
 func TestFinancialMigrationRoundTrip(t *testing.T) {
 	pool := testPool(t)
 	ctx := testContext(t)
+	down5, err := os.ReadFile("../../../migrations/000005_outbox.down.sql")
+	must(t, err)
+	_, err = pool.Exec(ctx, string(down5))
+	must(t, err)
 	down4, err := os.ReadFile("../../../migrations/000004_references.down.sql")
 	must(t, err)
 	_, err = pool.Exec(ctx, string(down4))

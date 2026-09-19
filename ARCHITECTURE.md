@@ -6,7 +6,7 @@ This living document records implemented architecture and agreed design decision
 
 **Decided; partially implemented.** The Go application is composed with Uber Fx. The domain must remain independent of Fx, HTTP, SQS, and persistence libraries. HTTP handlers and the SQS consumer will eventually call the same application use cases. Infrastructure adapters will implement interfaces required by the application/domain layers.
 
-Configuration, application composition, an HTTP server, the Money value object, the Wallet aggregate, and the WagerTransaction entity exist today. PostgreSQL repositories and transaction infrastructure are implemented. The financial application processor and append-only ledger implement BET, WIN, LOSS, REFUND and ROLLBACK, including explicit pending-reference resolution. Messaging components are not implemented yet.
+Configuration, application composition, an HTTP server, the Money value object, the Wallet aggregate, and the WagerTransaction entity exist today. PostgreSQL repositories and transaction infrastructure are implemented. The financial application processor and append-only ledger implement BET, WIN, LOSS, REFUND and ROLLBACK, including explicit pending-reference resolution. Transactional outbox snapshots and a transport-independent delivery service are implemented in checkpoint 5; no messaging transport or production publisher worker is started.
 
 ## Application composition and lifecycle
 
@@ -61,7 +61,7 @@ Application-supplied processing timestamps must be non-zero and are normalized t
 
 FailureCode is distinct from Go validation errors. `Reject` accepts business codes `BET_INSUFFICIENT_FUNDS`, `REVERSAL_INSUFFICIENT_FUNDS`, `REFERENCE_NOT_FOUND`, `CURRENCY_MISMATCH`, and `MONETARY_OVERFLOW`, `REFERENCE_NOT_ALLOWED`, `REFERENCE_MISMATCH`, `REFERENCE_UNSUCCESSFUL`, and `ALREADY_REVERSED`; `Fail` accepts `PERMANENT_INFRASTRUCTURE_FAILURE`. This small catalog validates the business/infrastructure category, not code applicability to individual operation kinds. The application must select the appropriate outcome and classify infrastructure failures; temporary outages do not imply FAILED. Wrapped Money errors remain available through `errors.Is`.
 
-**Deferred:** OPENING and outbox. Reference resolution, internal reference IDs, and cross-transaction validation are implemented in checkpoint 4 below. Application-owned persistence records now store fingerprints and replay balances, with keys in a separate binding table; these are not additional WagerTransaction domain fields. Initial persistence schema and explicit rehydration are implemented below. No financial movement or event generation occurs here. Future application code must coordinate WagerTransaction, Wallet, Ledger, and Outbox atomically.
+**Deferred:** OPENING. Transactional outbox is implemented in checkpoint 5 below. Reference resolution, internal reference IDs, and cross-transaction validation are implemented in checkpoint 4 below. Application-owned persistence records now store fingerprints and replay balances, with keys in a separate binding table; these are not additional WagerTransaction domain fields. Initial persistence schema and explicit rehydration are implemented below. No financial movement or event generation occurs here. The application coordinates WagerTransaction, Wallet, Ledger, and Outbox atomically; event creation does not belong to the domain entity.
 
 ## Persistence checkpoint 1
 
@@ -111,7 +111,7 @@ export DATABASE_URL="$TEST_DATABASE_URL"
 go run ./cmd/api
 ```
 
-Checkpoint 3 implements ledger, financial orchestration, and idempotency below. Outbox/inbox and multi-process financial scenarios remain deferred. Reference processing is implemented in checkpoint 4 below. No transaction retry or worker machinery is introduced.
+Checkpoint 3 implements ledger, financial orchestration, and idempotency below. Inbox and multi-process financial scenarios remain deferred; outbox is implemented in checkpoint 5 below. Reference processing is implemented in checkpoint 4 below. No transaction retry or worker machinery is introduced.
 
 ## Persistence/application checkpoint 3
 
@@ -153,7 +153,7 @@ Migration 000003 adds fingerprint/results, supporting composite keys, key bindin
 
 Integration fixtures apply all three migrations to isolated schemas. Tests cover financial outcomes and replay, key conflicts/aliases, schema constraints and append-only protection, real transaction rollback at multiple write stages, database-raised failure, independent-wallet progress, two concurrent BET 80.00 against 100.00, 50 distinct operations, 50 duplicate copies, and concurrent aliases. Synchronization uses channels and PostgreSQL lock observation rather than sleeps. UP/DOWN/UP and refusal of a populated legacy dataset are tested. Positive initial balances are fixtures; ledger assertions cover checkpoint deltas, not complete from-zero reconciliation without OPENING.
 
-Run all integration tests with the TEST_DATABASE_URL setup above, both normally and with -race. Three independent process verification is required later; concurrent connections/goroutines are not claimed as its substitute. Checkpoint 4 extends this processor with reference operations below. OPENING, outbox, inbox/SQS, HTTP financial endpoints, OAuth/OIDC, and recovery workers remain deferred. This checkpoint does not claim full challenge compliance or event-delivery guarantees.
+Run all integration tests with the TEST_DATABASE_URL setup above, both normally and with -race. Three independent process verification is required later; concurrent connections/goroutines are not claimed as its substitute. Checkpoint 4 extends this processor with reference operations below. OPENING, inbox/SQS, HTTP financial endpoints, OAuth/OIDC, and recovery workers remain deferred. Checkpoint 5 adds outbox persistence and explicit delivery invocations. This checkpoint does not claim full challenge compliance or event-delivery guarantees.
 
 ## Persistence/application checkpoint 4
 
@@ -194,7 +194,53 @@ Migration 000004 adds reference_transaction_id, reference_deadline_at, provider/
 
 Tests cover reference directions, contextual validation, provider isolation, pending/terminal references, aliases, strict expiration with an injected clock, historical replay, rollback of resolver failures, and the independent database uniqueness constraint. Channel barriers and observed PostgreSQL lock dependencies exercise competing reversals, two resolvers, replay versus resolver, and original versus reversal in both lock orders. Goroutines are cancelled and joined before cleanup; no sleeps establish correctness. Checkpoint 3 regression scenarios remain in the integration suite.
 
-HTTP, SQS/inbox, outbox, OAuth/OIDC, Keycloak, OPENING, background resolution/backoff, recovery workers and three-process verification remain deferred. This is not complete challenge compliance.
+HTTP, SQS/inbox, OAuth/OIDC, Keycloak, OPENING, background resolution/backoff, production workers and three-process verification remain deferred. Outbox delivery is described in checkpoint 5 below. This is not complete challenge compliance.
+
+## Persistence/application checkpoint 5 — Transactional outbox
+
+**Implemented.** `internal/application/events` constructs immutable integration snapshots. The financial `Repositories.Outbox` writer uses the exact same pgx transaction as wallet, wager transaction, ledger and idempotency bindings. Events are inserted after the outcome is determined and before the callback returns. Any construction/insertion failure rolls back the entire operation. The financial processor never publishes. Existing wallet-first locks, fingerprint, historical replay and reference deadline semantics remain unchanged.
+
+### Event contracts and emission
+
+| Confirmed outcome | Events |
+| --- | --- |
+| BET/WIN/REFUND/ROLLBACK PROCESSED | WagerTransactionProcessed + WalletBalanceChanged |
+| LOSS PROCESSED | WagerTransactionProcessed |
+| Any business REJECTED, including expired references | WagerTransactionRejected |
+| First transition to PENDING_REFERENCE | WagerTransactionPendingReference |
+| Remains pending, replay or alias | None |
+| FAILED | None |
+| Rolled-back operation | No committed events |
+
+Pending resolution adds the terminal event and a balance event only on actual movement. Existing pending events remain immutable. Each of the four concrete constructors fixes event type and schema version 1. The envelope contains eventId, eventType, aggregateId, correlationId, causationId, occurredAt, version and typed data. correlationId is the internal financial transaction ID; causationId is explicitly null. aggregateId is the wager transaction ID except for WalletBalanceChanged, where it is the wallet ID.
+
+Transaction data contains providerId, externalTransactionId, transactionId, playerId, walletId, roundId, gameId, kind, status, money, referenceExternalTransactionId, failureCode and resultingBalance. Optionals are explicit nulls; pending has no balance. Rejected snapshots use the saved actual wallet balance, whose currency may differ from the requested Money. WalletBalanceChanged contains walletId, transactionId, direction, money, balanceBefore, balanceAfter and walletVersion from the same movement used for the ledger. No transport key, request hash, internal reference, deadline or delivery metadata is exposed.
+
+Money serializes through Amount/Currency as fixed two-decimal strings and uppercase currency, without floats. Timestamps use UTC RFC3339 with microsecond precision. Go encoding/json serializes concrete payloads once. Event holds private metadata and a serialized string; JSON access returns a copy. JSONB may normalize formatting/key order, so byte-for-byte JSON formatting is not a contract. No event hashing is introduced; request fingerprint semantics are unchanged.
+
+### Schema and event identity
+
+Migration 000005 adds outbox_events with transaction FK (no cascade), aggregate/type/version, immutable JSONB envelope, occurrence timestamp and delivery metadata. Random 128-bit hexadecimal event IDs are generated once and persisted. UNIQUE(transaction_id,event_type) prevents duplicate logical events; a pending operation can legitimately have pending, processed and balance events with distinct IDs. Replays never construct or insert events.
+
+CHECK constraints enforce known types, positive version, non-negative attempts, finite timestamps, paired lease fields, no lease on published events, and JSON object/envelope identity consistency. Missing JSON fields are rejected explicitly through IS TRUE. A trigger protects event identity, transaction, aggregate, type/version, payload and occurrence; DELETE/TRUNCATE are rejected. Publication timestamps, attempts, scheduling, leases and bounded diagnostics are the only mutable columns. No generic Save/update API is exposed. Privileged schema owners remain able to disable protections, as with ledger triggers.
+
+The partial pending index is (next_attempt_at,id) WHERE published_at IS NULL. No historical events are backfilled: existing financial records are not re-emitted. A pre-existing pending operation emits its future terminal events when resolved, without inventing an earlier pending event. DOWN takes an exclusive table lock and refuses a non-empty outbox to prevent silent loss; prior migrations are unchanged.
+
+### Delivery and recovery
+
+`internal/application/outbox.Service.RunOnce` claims at most one event and publishes through EventPublisher, then marks success or reschedules failure. It is explicitly invoked and does not start a production background worker or fake transport. Options are constructor-injected, with DefaultConfig: publish timeout 10s, lease 30s, initial backoff 1s, maximum 5m. Invalid/non-positive values or a lease not longer than publish timeout are rejected. Clock is injected; no environment reads or financial time.Now calls are introduced.
+
+PostgreSQL ClaimBatch uses a short READ COMMITTED transaction and SELECT FOR UPDATE SKIP LOCKED. Eligibility requires unpublished, due next_attempt_at, and an absent/expired lease. Claiming sets a fresh random token, lease deadline and increments attempt_count. The claim transaction commits before any network call. Records may proceed independently across instances. One event per service invocation avoids a locally queued batch consuming leases before publication.
+
+MarkPublished and Reschedule are guarded by event ID, current lease token and unpublished state. A replaced token cannot update metadata. Reschedule clears the lease and sets the next attempt; only fixed safe diagnostic categories (publish_failed, publish_timeout, publish_cancelled) are stored, never raw transport errors. Retry delay doubles with a cap and never discards an event after an attempt limit. An unsuccessful metadata write or interrupted process leaves a lease that another invocation can reclaim after expiry. No lease-renewal loop or scheduler is needed for this bounded invocation.
+
+Delivery is **at-least-once**, not exactly-once. Publication accepted followed by a crash/unknown acknowledgement before MarkPublished can cause republication with the same persisted eventId. This ID supports downstream durable deduplication. A stale publisher can still complete external I/O after lease expiry; fencing protects database updates, not the external broker, so duplicates remain part of the contract. Eventual delivery assumes future invocations and recovery of dependencies. Production workers and broker integration remain deferred.
+
+No ordering is promised. PendingReference may arrive after a terminal event; consumers must not regress terminal status. WalletBalanceChanged carries walletVersion for ordering balance snapshots. Envelope version is a schema version, not a financial sequence. No global mutex or serialization is used.
+
+### Verification
+
+Unit tests cover concrete snapshots, null fields, exact Money formatting, invalid events, retry limits, configuration, clock and safe diagnostics. Real PostgreSQL tests cover the emission matrix, pending resolution/replay, atomic rollback before/during/after event insertion, uncommitted invisibility, logical uniqueness, immutable columns, DELETE/TRUNCATE rejection, claim concurrency, SKIP LOCKED progress, lease recovery/fencing, publish/retry/restart and duplicate delivery with stable IDs. Migration UP/DOWN/UP and populated-DOWN refusal use isolated schemas. Existing financial regression tests remain intact in meaning. Concurrency uses explicit synchronization and injected times, not arbitrary sleeps.
 
 ## Concurrency direction
 
@@ -206,7 +252,7 @@ The following mechanisms remain incomplete; implemented checkpoint decisions abo
 
 ### PostgreSQL transaction boundaries — To be decided
 
-pgx, application-owned transaction callbacks, and READ COMMITTED are implemented. Wallet, transaction, ledger, key bindings, and saved results are now grouped atomically. Inbox/outbox integration remains deferred.
+pgx, application-owned transaction callbacks, and READ COMMITTED are implemented. Wallet, transaction, ledger, key bindings, and saved results are now grouped atomically. Outbox now shares that transaction; inbox integration remains deferred.
 
 ### Wallet concurrency control — To be decided
 
@@ -224,9 +270,9 @@ Schema, immutable entries, and database protections are implemented above. Openi
 
 Message identity/hash storage, duplicate handling, transaction integration, and durable completion before SQS acknowledgment.
 
-### Transactional outbox — To be decided
+### Transactional outbox — Implemented core; transport deferred
 
-Event contracts and snapshots, output destination, concurrent publisher coordination, retries, and recovery with stable event identities.
+Checkpoint 5 defines snapshots, concurrent claims, retries and recovery. Output destination, SQS adapter and production worker lifecycle remain undecided.
 
 ### Reference and reversal processing — To be decided
 

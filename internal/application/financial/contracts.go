@@ -3,6 +3,7 @@ package financial
 import (
 	"context"
 	"errors"
+	"github.com/jowxavier/backend-challenge-go/internal/application/events"
 	"time"
 
 	"github.com/jowxavier/backend-challenge-go/internal/domain/ledger"
@@ -69,7 +70,12 @@ type Ledger interface {
 	Insert(context.Context, ledger.Entry) error
 }
 
+type OutboxWriter interface {
+	Insert(context.Context, events.Event) error
+}
+
 type Repositories struct {
+	Outbox       OutboxWriter
 	Wallets      Wallets
 	Transactions Transactions
 	Keys         Keys

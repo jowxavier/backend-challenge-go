@@ -3,6 +3,7 @@ package financial
 import (
 	"context"
 	"errors"
+	"github.com/jowxavier/backend-challenge-go/internal/application/events"
 	"time"
 
 	"github.com/jowxavier/backend-challenge-go/internal/domain/ledger"
@@ -118,6 +119,13 @@ func (p *Processor) execute(ctx context.Context, repos Repositories, record Reco
 				if err := repos.Transactions.MarkPendingReference(ctx, t, deadline); err != nil {
 					return ProcessResult{}, err
 				}
+				event, err := events.NewPendingReference(t)
+				if err != nil {
+					return ProcessResult{}, err
+				}
+				if err = repos.Outbox.Insert(ctx, event); err != nil {
+					return ProcessResult{}, err
+				}
 			}
 			return resultOf(record, expected == wt.PENDING_REFERENCE), nil
 		}
@@ -137,6 +145,7 @@ func (p *Processor) execute(ctx context.Context, repos Repositories, record Reco
 		}
 	}
 	before, version := w.Balance(), w.Version()
+	var movement ledger.Entry
 	if code == "" && t.Kind() != wt.LOSS {
 		var err error
 		if direction == ledger.Debit {
@@ -171,6 +180,7 @@ func (p *Processor) execute(ctx context.Context, repos Repositories, record Reco
 			if err != nil {
 				return ProcessResult{}, err
 			}
+			movement = entry
 			if err := repos.Wallets.UpdateBalance(ctx, *w, version); err != nil {
 				return ProcessResult{}, err
 			}
@@ -185,6 +195,28 @@ func (p *Processor) execute(ctx context.Context, repos Repositories, record Reco
 	balance := w.Balance()
 	if err := repos.Transactions.CompleteOutcome(ctx, t, expected, balance); err != nil {
 		return ProcessResult{}, err
+	}
+	var event events.Event
+	var err error
+	if t.Status() == wt.REJECTED {
+		event, err = events.NewRejected(t, balance)
+	} else {
+		event, err = events.NewProcessed(t, balance)
+	}
+	if err != nil {
+		return ProcessResult{}, err
+	}
+	if err = repos.Outbox.Insert(ctx, event); err != nil {
+		return ProcessResult{}, err
+	}
+	if movement.ID() != "" {
+		event, err = events.NewBalanceChanged(movement, w.Version())
+		if err != nil {
+			return ProcessResult{}, err
+		}
+		if err = repos.Outbox.Insert(ctx, event); err != nil {
+			return ProcessResult{}, err
+		}
 	}
 	record.Balance = &balance
 	return resultOf(record, false), nil
